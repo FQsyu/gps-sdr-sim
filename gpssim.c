@@ -11,6 +11,9 @@
 #include <unistd.h>
 #endif
 #include "gpssim.h"
+#ifdef ENABLE_CUDA
+#include "gpssim_cuda.cuh"
+#endif
 
 int sinTable512[] = {
 	   2,   5,   8,  11,  14,  17,  20,  23,  26,  29,  32,  35,  38,  41,  44,  47,
@@ -133,18 +136,29 @@ double dotProd(const double *x1, const double *x2)
  */
 void codegen(int *ca, int prn)
 {
-	int delay[] = {
+	// GPS PRN 1-32 G2 delays
+	int delay_gps[] = {
 		  5,   6,   7,   8,  17,  18, 139, 140, 141, 251,
 		252, 254, 255, 256, 257, 258, 469, 470, 471, 472,
 		473, 474, 509, 512, 513, 514, 515, 516, 859, 860,
 		861, 862};
 
+	// QZSS PRN 193-202 G2 delays (IS-QZSS-PNT)
+	int delay_qzss[] = {
+		339, 208, 711, 189, 263, 537, 663, 942, 173, 900
+	};
+
+	int delay = 0;
 	int g1[CA_SEQ_LEN], g2[CA_SEQ_LEN];
 	int r1[N_DWRD_SBF], r2[N_DWRD_SBF];
 	int c1, c2;
 	int i,j;
 
-	if (prn<1 || prn>32)
+	if (prn >= 1 && prn <= GPS_MAX_PRN)
+		delay = delay_gps[prn - 1];
+	else if (prn >= QZSS_PRN_START && prn <= QZSS_PRN_END)
+		delay = delay_qzss[prn - QZSS_PRN_START];
+	else
 		return;
 
 	for (i=0; i<N_DWRD_SBF; i++)
@@ -166,7 +180,7 @@ void codegen(int *ca, int prn)
 		r2[0] = c2;
 	}
 
-	for (i=0,j=CA_SEQ_LEN-delay[prn-1]; i<CA_SEQ_LEN; i++,j++)
+	for (i=0,j=CA_SEQ_LEN-delay; i<CA_SEQ_LEN; i++,j++)
 		ca[i] = (1-g1[i]*g2[j%CA_SEQ_LEN])/2;
 
 	return;
@@ -953,35 +967,122 @@ int readRinexNavAll(ephem_t eph[][MAX_SAT], ionoutc_t *ionoutc, const char *fnam
 		if (NULL==fgets(str, MAX_CHAR, fp))
 			break;
 
-		// PRN
-		strncpy(tmp, str, 2);
-		tmp[2] = 0;
-		sv = atoi(tmp)-1;
+		// Strip carriage return / newline
+		int slen = (int)strlen(str);
+		while (slen > 0 && (str[slen-1] == '\r' || str[slen-1] == '\n'))
+			str[--slen] = 0;
+		if (slen == 0)
+			continue;
 
-		// EPOCH
-		strncpy(tmp, str+3, 2);
-		tmp[2] = 0;
-		t.y = atoi(tmp) + 2000;
+		int prn = 0;
+		int field_offset = 3;
+		int clk_offset = 22;
 
-		strncpy(tmp, str+6, 2);
-		tmp[2] = 0;
-		t.m = atoi(tmp);
+		if (str[0] == 'G' || str[0] == 'g')
+		{
+			strncpy(tmp, str+1, 2);
+			tmp[2] = 0;
+			prn = atoi(tmp);
+		}
+		else if (str[0] == 'J' || str[0] == 'j')
+		{
+			if (str[3] == ' ' || str[3] == 0)
+			{
+				strncpy(tmp, str+1, 2);
+				tmp[2] = 0;
+				int jnum = atoi(tmp);
+				if (jnum >= 193 && jnum <= 202)
+					prn = jnum;
+				else if (jnum >= 1 && jnum <= 10)
+					prn = 192 + jnum;
+				else
+					prn = 192 + jnum;
+			}
+			else
+			{
+				prn = atoi(str+1);
+			}
+		}
+		else if (str[0] == 'E' || str[0] == 'e' || str[0] == 'C' || str[0] == 'c')
+		{
+			// Galileo / BeiDou: skip 7 lines
+			int sk;
+			for (sk = 0; sk < 7; sk++) {
+				if (NULL == fgets(str, MAX_CHAR, fp)) break;
+			}
+			continue;
+		}
+		else if (str[0] == 'R' || str[0] == 'r' || str[0] == 'S' || str[0] == 's')
+		{
+			// GLONASS / SBAS: skip 3 lines
+			int sk;
+			for (sk = 0; sk < 3; sk++) {
+				if (NULL == fgets(str, MAX_CHAR, fp)) break;
+			}
+			continue;
+		}
+		else
+		{
+			// Standard RINEX 2 without system prefix (GPS PRN 1-32, or QZSS PRN 193-202)
+			strncpy(tmp, str, 3);
+			tmp[3] = 0;
+			prn = atoi(tmp);
+		}
 
-		strncpy(tmp, str+9, 2);
-		tmp[2] = 0;
-		t.d = atoi(tmp);
+		sv = prn2sat(prn);
+		if (sv < 0 || sv >= MAX_SAT)
+		{
+			// Unsupported or invalid satellite, skip subsequent 7 orbit lines
+			int sk;
+			for (sk = 0; sk < 7; sk++) {
+				if (NULL == fgets(str, MAX_CHAR, fp)) break;
+			}
+			continue;
+		}
 
-		strncpy(tmp, str+12, 2);
-		tmp[2] = 0;
-		t.hh = atoi(tmp);
+		// Parse Epoch
+		int epoch_start = 3;
+		if (str[0] == 'G' || str[0] == 'g' || str[0] == 'J' || str[0] == 'j')
+			epoch_start = 4;
 
-		strncpy(tmp, str+15, 2);
-		tmp[2] = 0;
-		t.mm = atoi(tmp);
+		int y_val = 0, m_val = 0, d_val = 0, hh_val = 0, mm_val = 0;
+		double sec_val = 0.0;
+		if (sscanf(str + epoch_start, "%d %d %d %d %d %lf",
+		           &y_val, &m_val, &d_val, &hh_val, &mm_val, &sec_val) == 6)
+		{
+			if (y_val < 100)
+				t.y = y_val + 2000;
+			else
+				t.y = y_val;
+			t.m = m_val;
+			t.d = d_val;
+			t.hh = hh_val;
+			t.mm = mm_val;
+			t.sec = sec_val;
 
-		strncpy(tmp, str+18, 4);
-		tmp[2] = 0;
-		t.sec = atof(tmp);
+			if (y_val >= 1000)
+			{
+				field_offset = 4;
+				clk_offset = 23;
+			}
+			else
+			{
+				field_offset = 3;
+				clk_offset = 22;
+			}
+		}
+		else
+		{
+			// Fallback to legacy fixed-width indexing
+			strncpy(tmp, str+3, 2); tmp[2] = 0; t.y = atoi(tmp) + 2000;
+			strncpy(tmp, str+6, 2); tmp[2] = 0; t.m = atoi(tmp);
+			strncpy(tmp, str+9, 2); tmp[2] = 0; t.d = atoi(tmp);
+			strncpy(tmp, str+12, 2); tmp[2] = 0; t.hh = atoi(tmp);
+			strncpy(tmp, str+15, 2); tmp[2] = 0; t.mm = atoi(tmp);
+			strncpy(tmp, str+18, 4); tmp[2] = 0; t.sec = atof(tmp);
+			field_offset = 3;
+			clk_offset = 22;
+		}
 
 		date2gps(&t, &g);
 
@@ -1006,17 +1107,17 @@ int readRinexNavAll(ephem_t eph[][MAX_SAT], ionoutc_t *ionoutc, const char *fnam
 		// SV CLK
 		eph[ieph][sv].toc = g;
 
-		strncpy(tmp, str+22, 19);
+		strncpy(tmp, str+clk_offset, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19); // tmp[15]='E';
 		eph[ieph][sv].af0 = atof(tmp);
 
-		strncpy(tmp, str+41, 19);
+		strncpy(tmp, str+clk_offset+19, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].af1 = atof(tmp);
 
-		strncpy(tmp, str+60, 19);
+		strncpy(tmp, str+clk_offset+38, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].af2 = atof(tmp);
@@ -1025,22 +1126,22 @@ int readRinexNavAll(ephem_t eph[][MAX_SAT], ionoutc_t *ionoutc, const char *fnam
 		if (NULL==fgets(str, MAX_CHAR, fp))
 			break;
 
-		strncpy(tmp, str+3, 19);
+		strncpy(tmp, str+field_offset, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].iode = (int)atof(tmp);
 
-		strncpy(tmp, str+22, 19);
+		strncpy(tmp, str+field_offset+19, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].crs = atof(tmp);
 
-		strncpy(tmp, str+41, 19);
+		strncpy(tmp, str+field_offset+38, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].deltan = atof(tmp);
 
-		strncpy(tmp, str+60, 19);
+		strncpy(tmp, str+field_offset+57, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].m0 = atof(tmp);
@@ -1049,22 +1150,22 @@ int readRinexNavAll(ephem_t eph[][MAX_SAT], ionoutc_t *ionoutc, const char *fnam
 		if (NULL==fgets(str, MAX_CHAR, fp))
 			break;
 
-		strncpy(tmp, str+3, 19);
+		strncpy(tmp, str+field_offset, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].cuc = atof(tmp);
 
-		strncpy(tmp, str+22, 19);
+		strncpy(tmp, str+field_offset+19, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].ecc = atof(tmp);
 
-		strncpy(tmp, str+41, 19);
+		strncpy(tmp, str+field_offset+38, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].cus = atof(tmp);
 
-		strncpy(tmp, str+60, 19);
+		strncpy(tmp, str+field_offset+57, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].sqrta = atof(tmp);
@@ -1073,22 +1174,22 @@ int readRinexNavAll(ephem_t eph[][MAX_SAT], ionoutc_t *ionoutc, const char *fnam
 		if (NULL==fgets(str, MAX_CHAR, fp))
 			break;
 
-		strncpy(tmp, str+3, 19);
+		strncpy(tmp, str+field_offset, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].toe.sec = atof(tmp);
 
-		strncpy(tmp, str+22, 19);
+		strncpy(tmp, str+field_offset+19, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].cic = atof(tmp);
 
-		strncpy(tmp, str+41, 19);
+		strncpy(tmp, str+field_offset+38, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].omg0 = atof(tmp);
 
-		strncpy(tmp, str+60, 19);
+		strncpy(tmp, str+field_offset+57, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].cis = atof(tmp);
@@ -1097,22 +1198,22 @@ int readRinexNavAll(ephem_t eph[][MAX_SAT], ionoutc_t *ionoutc, const char *fnam
 		if (NULL==fgets(str, MAX_CHAR, fp))
 			break;
 
-		strncpy(tmp, str+3, 19);
+		strncpy(tmp, str+field_offset, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].inc0 = atof(tmp);
 
-		strncpy(tmp, str+22, 19);
+		strncpy(tmp, str+field_offset+19, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].crc = atof(tmp);
 
-		strncpy(tmp, str+41, 19);
+		strncpy(tmp, str+field_offset+38, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].aop = atof(tmp);
 
-		strncpy(tmp, str+60, 19);
+		strncpy(tmp, str+field_offset+57, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].omgdot = atof(tmp);
@@ -1121,17 +1222,17 @@ int readRinexNavAll(ephem_t eph[][MAX_SAT], ionoutc_t *ionoutc, const char *fnam
 		if (NULL==fgets(str, MAX_CHAR, fp))
 			break;
 
-		strncpy(tmp, str+3, 19);
+		strncpy(tmp, str+field_offset, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].idot = atof(tmp);
 
-		strncpy(tmp, str+22, 19);
+		strncpy(tmp, str+field_offset+19, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].codeL2 = (int)atof(tmp);
 
-		strncpy(tmp, str+41, 19);
+		strncpy(tmp, str+field_offset+38, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].toe.week = (int)atof(tmp);
@@ -1140,19 +1241,19 @@ int readRinexNavAll(ephem_t eph[][MAX_SAT], ionoutc_t *ionoutc, const char *fnam
 		if (NULL==fgets(str, MAX_CHAR, fp))
 			break;
 
-		strncpy(tmp, str+22, 19);
+		strncpy(tmp, str+field_offset+19, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].svhlth = (int)atof(tmp);
 		if ((eph[ieph][sv].svhlth>0) && (eph[ieph][sv].svhlth<32))
 			eph[ieph][sv].svhlth += 32; // Set MSB to 1
 
-		strncpy(tmp, str+41, 19);
+		strncpy(tmp, str+field_offset+38, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].tgd = atof(tmp);
 
-		strncpy(tmp, str+60, 19);
+		strncpy(tmp, str+field_offset+57, 19);
 		tmp[19] = 0;
 		replaceExpDesignator(tmp, 19);
 		eph[ieph][sv].iodc = (int)atof(tmp);
@@ -1649,7 +1750,7 @@ int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t 
 					if (chan[i].prn==0)
 					{
 						// Initialize channel
-						chan[i].prn = sv+1;
+						chan[i].prn = sat2prn(sv);
 						chan[i].azel[0] = azel[0];
 						chan[i].azel[1] = azel[1];
 
@@ -1722,7 +1823,11 @@ void usage(void)
 		"  -b <iq_bits>     I/Q data format [1/8/16] (default: 16)\n"
 		"  -i               Disable ionospheric delay for spacecraft scenario\n"
 		"  -p [fixed_gain]  Disable path loss and hold power level constant\n"
-		"  -v               Show details about simulated channels\n",
+		"  -v               Show details about simulated channels\n"
+#ifdef ENABLE_CUDA
+		"  -G               Disable GPU acceleration (fallback to CPU)\n"
+#endif
+		,
 		((double)USER_MOTION_SIZE) / 10.0, STATIC_MAX_DURATION);
 
 	return;
@@ -1749,6 +1854,12 @@ int main(int argc, char *argv[])
 	int iTable;
 	short *iq_buff = NULL;
 	signed char *iq8_buff = NULL;
+
+#ifdef ENABLE_CUDA
+	int use_cuda = TRUE;
+#else
+	int use_cuda = FALSE;
+#endif
 
 	gpstime_t grx;
 	double delt;
@@ -1816,10 +1927,15 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	while ((result=getopt(argc,argv,"e:u:x:g:c:l:o:s:b:L:T:t:d:ipv"))!=-1)
+	while ((result=getopt(argc,argv,"e:u:x:g:c:l:o:s:b:L:T:t:d:ipvG"))!=-1)
 	{
 		switch (result)
 		{
+#ifdef ENABLE_CUDA
+		case 'G':
+			use_cuda = FALSE;
+			break;
+#endif
 		case 'e':
 			strcpy(navfile, optarg);
 			break;
@@ -2221,6 +2337,17 @@ int main(int argc, char *argv[])
 		fp = stdout;
 	}
 
+#ifdef ENABLE_CUDA
+	if (use_cuda)
+	{
+		if (cuda_init_simulator(iq_buff_size, data_format) < 0)
+		{
+			fprintf(stderr, "CUDA initialization failed, falling back to CPU.\n");
+			use_cuda = FALSE;
+		}
+	}
+#endif
+
 	////////////////////////////////////////////////////////////
 	// Initialize channels
 	////////////////////////////////////////////////////////////
@@ -2270,7 +2397,7 @@ int main(int argc, char *argv[])
 			{
 				// Refresh code phase and data bit counters
 				range_t rho;
-				sv = chan[i].prn-1;
+				sv = prn2sat(chan[i].prn);
 
 				// Current pseudorange
 				if (!staticLocationMode)
@@ -2301,107 +2428,133 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		for (isamp=0; isamp<iq_buff_size; isamp++)
+#ifdef ENABLE_CUDA
+		if (use_cuda)
 		{
-			int i_acc = 0;
-			int q_acc = 0;
-
-			for (i=0; i<MAX_CHAN; i++)
+			if (iumd > 1)
 			{
-				if (chan[i].prn>0)
+				void *out_ptr = NULL;
+				size_t out_bytes = 0;
+				cuda_sync_and_get_output(&out_ptr, &out_bytes, iumd - 1);
+				fwrite(out_ptr, 1, out_bytes, fp);
+			}
+
+			cuda_queue_block(chan, MAX_CHAN, gain, delt, iumd);
+
+			// Advance carrier phase for the simulated 0.1s interval
+			for (i = 0; i < MAX_CHAN; i++)
+			{
+				if (chan[i].prn > 0)
 				{
-#ifdef FLOAT_CARR_PHASE
-					iTable = (int)floor(chan[i].carr_phase*512.0);
-#else
-					iTable = (chan[i].carr_phase >> 16) & 0x1ff; // 9-bit index
-#endif
-					ip = chan[i].dataBit * chan[i].codeCA * cosTable512[iTable] * gain[i];
-					qp = chan[i].dataBit * chan[i].codeCA * sinTable512[iTable] * gain[i];
-
-					// Accumulate for all visible satellites
-					i_acc += ip;
-					q_acc += qp;
-
-					// Update code phase
-					chan[i].code_phase += chan[i].f_code * delt;
-
-					if (chan[i].code_phase>=CA_SEQ_LEN)
-					{
-						chan[i].code_phase -= CA_SEQ_LEN;
-
-						chan[i].icode++;
-
-						if (chan[i].icode>=20) // 20 C/A codes = 1 navigation data bit
-						{
-							chan[i].icode = 0;
-							chan[i].ibit++;
-
-							if (chan[i].ibit>=30) // 30 navigation data bits = 1 word
-							{
-								chan[i].ibit = 0;
-								chan[i].iword++;
-								/*
-								if (chan[i].iword>=N_DWRD)
-									fprintf(stderr, "\nWARNING: Subframe word buffer overflow.\n");
-								*/
-							}
-
-							// Set new navigation data bit
-							chan[i].dataBit = (int)((chan[i].dwrd[chan[i].iword]>>(29-chan[i].ibit)) & 0x1UL)*2-1;
-						}
-					}
-
-					// Set current code chip
-					chan[i].codeCA = chan[i].ca[(int)chan[i].code_phase]*2-1;
-
-					// Update carrier phase
-#ifdef FLOAT_CARR_PHASE
-					chan[i].carr_phase += chan[i].f_carr * delt;
-
-					if (chan[i].carr_phase >= 1.0)
-						chan[i].carr_phase -= 1.0;
-					else if (chan[i].carr_phase<0.0)
-						chan[i].carr_phase += 1.0;
-#else
-					chan[i].carr_phase += chan[i].carr_phasestep;
-#endif
+					chan[i].carr_phase += (unsigned int)iq_buff_size * (unsigned int)chan[i].carr_phasestep;
 				}
 			}
-
-			// Scaled by 2^7
-			i_acc = (i_acc+64)>>7;
-			q_acc = (q_acc+64)>>7;
-
-			// Store I/Q samples into buffer
-			iq_buff[isamp*2] = (short)i_acc;
-			iq_buff[isamp*2+1] = (short)q_acc;
 		}
-
-		if (data_format==SC01)
+		else
+#endif
 		{
-			for (isamp=0; isamp<2*iq_buff_size; isamp++)
+			for (isamp=0; isamp<iq_buff_size; isamp++)
 			{
-				if (isamp%8==0)
-					iq8_buff[isamp/8] = 0x00;
+				int i_acc = 0;
+				int q_acc = 0;
 
-				iq8_buff[isamp/8] |= (iq_buff[isamp]>0?0x01:0x00)<<(7-isamp%8);
+				for (i=0; i<MAX_CHAN; i++)
+				{
+					if (chan[i].prn>0)
+					{
+#ifdef FLOAT_CARR_PHASE
+						iTable = (int)floor(chan[i].carr_phase*512.0);
+#else
+						iTable = (chan[i].carr_phase >> 16) & 0x1ff; // 9-bit index
+#endif
+						ip = chan[i].dataBit * chan[i].codeCA * cosTable512[iTable] * gain[i];
+						qp = chan[i].dataBit * chan[i].codeCA * sinTable512[iTable] * gain[i];
+
+						// Accumulate for all visible satellites
+						i_acc += ip;
+						q_acc += qp;
+
+						// Update code phase
+						chan[i].code_phase += chan[i].f_code * delt;
+
+						if (chan[i].code_phase>=CA_SEQ_LEN)
+						{
+							chan[i].code_phase -= CA_SEQ_LEN;
+
+							chan[i].icode++;
+
+							if (chan[i].icode>=20) // 20 C/A codes = 1 navigation data bit
+							{
+								chan[i].icode = 0;
+								chan[i].ibit++;
+
+								if (chan[i].ibit>=30) // 30 navigation data bits = 1 word
+								{
+									chan[i].ibit = 0;
+									chan[i].iword++;
+									/*
+									if (chan[i].iword>=N_DWRD)
+										fprintf(stderr, "\nWARNING: Subframe word buffer overflow.\n");
+									*/
+								}
+
+								// Set new navigation data bit
+								chan[i].dataBit = (int)((chan[i].dwrd[chan[i].iword]>>(29-chan[i].ibit)) & 0x1UL)*2-1;
+							}
+						}
+
+						// Set current code chip
+						chan[i].codeCA = chan[i].ca[(int)chan[i].code_phase]*2-1;
+
+						// Update carrier phase
+#ifdef FLOAT_CARR_PHASE
+						chan[i].carr_phase += chan[i].f_carr * delt;
+
+						if (chan[i].carr_phase >= 1.0)
+							chan[i].carr_phase -= 1.0;
+						else if (chan[i].carr_phase<0.0)
+							chan[i].carr_phase += 1.0;
+#else
+						chan[i].carr_phase += chan[i].carr_phasestep;
+#endif
+					}
+				}
+
+				// Scaled by 2^7
+				i_acc = (i_acc+64)>>7;
+				q_acc = (q_acc+64)>>7;
+
+				// Store I/Q samples into buffer
+				iq_buff[isamp*2] = (short)i_acc;
+				iq_buff[isamp*2+1] = (short)q_acc;
 			}
 
-			fwrite(iq8_buff, 1, iq_buff_size/4, fp);
-		}
-		else if (data_format==SC08)
-		{
-			for (isamp=0; isamp<2*iq_buff_size; isamp++)
+			if (data_format==SC01)
 			{
-				iq8_buff[isamp] = iq_buff[isamp]>>4; // 12-bit bladeRF -> 8-bit HackRF
-				//iq8_buff[isamp] = iq_buff[isamp] >> 8; // for PocketSDR
-			}
+				for (isamp=0; isamp<2*iq_buff_size; isamp++)
+				{
+					if (isamp%8==0)
+						iq8_buff[isamp/8] = 0x00;
 
-			fwrite(iq8_buff, 1, 2*iq_buff_size, fp);
-		}
-		else // data_format==SC16
-		{
-			fwrite(iq_buff, 2, 2*iq_buff_size, fp);
+					iq8_buff[isamp/8] |= (iq_buff[isamp]>0?0x01:0x00)<<(7-isamp%8);
+				}
+
+				fwrite(iq8_buff, 1, iq_buff_size/4, fp);
+			}
+			else if (data_format==SC08)
+			{
+				for (isamp=0; isamp<2*iq_buff_size; isamp++)
+				{
+					iq8_buff[isamp] = iq_buff[isamp]>>4; // 12-bit bladeRF -> 8-bit HackRF
+					//iq8_buff[isamp] = iq_buff[isamp] >> 8; // for PocketSDR
+				}
+
+				fwrite(iq8_buff, 1, 2*iq_buff_size, fp);
+			}
+			else // data_format==SC16
+			{
+				fwrite(iq_buff, 2, 2*iq_buff_size, fp);
+			}
 		}
 
 		//
@@ -2434,7 +2587,7 @@ int main(int argc, char *argv[])
 						{
 							// Generate new subframes if allocated
 							if (chan[i].prn!=0)
-								eph2sbf(eph[ieph][chan[i].prn-1], ionoutc, chan[i].sbf);
+								eph2sbf(eph[ieph][prn2sat(chan[i].prn)], ionoutc, chan[i].sbf);
 						}
 					}
 
@@ -2469,12 +2622,27 @@ int main(int argc, char *argv[])
 		fflush(stdout);
 	}
 
+#ifdef ENABLE_CUDA
+	if (use_cuda && numd > 1)
+	{
+		void *out_ptr = NULL;
+		size_t out_bytes = 0;
+		cuda_sync_and_get_output(&out_ptr, &out_bytes, numd - 1);
+		fwrite(out_ptr, 1, out_bytes, fp);
+	}
+#endif
+
 	tend = clock();
 
 	fprintf(stderr, "\nDone!\n");
 
 	// Free I/Q buffer
 	free(iq_buff);
+
+#ifdef ENABLE_CUDA
+	if (use_cuda)
+		cuda_cleanup_simulator();
+#endif
 
 	// Close file
 	fclose(fp);

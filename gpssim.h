@@ -9,8 +9,31 @@
 /*! \brief Maximum length of a line in a text file (RINEX, motion) */
 #define MAX_CHAR (100)
 
-/*! \brief Maximum number of satellites in RINEX file */
-#define MAX_SAT (32)
+#define GPS_MAX_PRN (32)
+#define QZSS_PRN_START (193)
+#define QZSS_PRN_END (202)
+#define QZSS_MAX_PRN (10)
+
+/*! \brief Maximum number of satellites in RINEX file (GPS + QZSS) */
+#define MAX_SAT (GPS_MAX_PRN + QZSS_MAX_PRN)
+
+static inline int prn2sat(int prn)
+{
+	if (prn >= 1 && prn <= GPS_MAX_PRN)
+		return prn - 1;
+	if (prn >= QZSS_PRN_START && prn <= QZSS_PRN_END)
+		return GPS_MAX_PRN + (prn - QZSS_PRN_START);
+	return -1;
+}
+
+static inline int sat2prn(int sv)
+{
+	if (sv >= 0 && sv < GPS_MAX_PRN)
+		return sv + 1;
+	if (sv >= GPS_MAX_PRN && sv < MAX_SAT)
+		return QZSS_PRN_START + (sv - GPS_MAX_PRN);
+	return 0;
+}
 
 /*! \brief Maximum number of channels we simulate */
 #define MAX_CHAN (16)

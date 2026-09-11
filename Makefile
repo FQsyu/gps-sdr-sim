@@ -5,16 +5,34 @@ all: gps-sdr-sim
 
 SHELL=/bin/bash
 CC=gcc
+NVCC?=nvcc
 CFLAGS=-O3 -Wall -D_FILE_OFFSET_BITS=64
 ifdef USER_MOTION_SIZE
 CFLAGS+=-DUSER_MOTION_SIZE=$(USER_MOTION_SIZE)
 endif
 LDFLAGS=-lm
 
-gps-sdr-sim: gpssim.o
-	${CC} $< ${LDFLAGS} -o $@
+# Check if CUDA is enabled and available
+ENABLE_CUDA ?= $(shell which $(NVCC) >/dev/null 2>&1 && echo 1 || echo 0)
 
-gpssim.o: .user-motion-size gpssim.h
+ifeq ($(ENABLE_CUDA), 1)
+CFLAGS+=-DENABLE_CUDA
+NVCCFLAGS=-O3 -arch=native
+OBJS=gpssim.o gpssim_cuda.o
+LD=$(NVCC)
+else
+OBJS=gpssim.o
+LD=$(CC)
+endif
+
+gps-sdr-sim: $(OBJS)
+	${LD} $^ ${LDFLAGS} -o $@
+
+gpssim.o: gpssim.c .user-motion-size gpssim.h
+	${CC} -c ${CFLAGS} $< -o $@
+
+gpssim_cuda.o: gpssim_cuda.cu gpssim_cuda.cuh gpssim.h
+	${NVCC} -c ${NVCCFLAGS} $< -o $@
 
 .user-motion-size: .FORCE
 	@if [ -f .user-motion-size ]; then \
@@ -27,7 +45,7 @@ gpssim.o: .user-motion-size gpssim.h
 	fi;
 
 clean:
-	rm -f gpssim.o gps-sdr-sim *.bin .user-motion-size
+	rm -f gpssim.o gpssim_cuda.o gps-sdr-sim *.bin .user-motion-size
 
 time: gps-sdr-sim
 	time ./gps-sdr-sim -e brdc3540.14n -u circle.csv -b 1
