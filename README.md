@@ -1,22 +1,50 @@
 # GPS-SDR-SIM
 
-GPS-SDR-SIM generates GPS baseband signal data streams, which can be converted 
+GPS-SDR-SIM generates GPS and QZSS (Quasi-Zenith Satellite System / Michibiki) baseband signal data streams, which can be converted 
 to RF using software-defined radio (SDR) platforms, such as 
 [ADALM-Pluto](https://wiki.analog.com/university/tools/pluto), [bladeRF](http://nuand.com/), [HackRF](https://github.com/mossmann/hackrf/wiki), and [USRP](http://www.ettus.com/).
 
-### Windows build instructions
+### Features
+
+- **GPS L1C/A & QZSS L1C/A**: Generates L1C/A signals for GPS (PRN 1–32) and QZSS (PRN 193–202, IS-QZSS-PNT compliant).
+- **RINEX 2 & 3 Navigation Files**: Reads and parses both GPS (`G` prefix) and QZSS (`J` prefix) ephemerides.
+- **CUDA GPU Acceleration**: Fast baseband I/Q sample generation offloaded to NVIDIA CUDA GPUs with double-buffered asynchronous stream pipeline (e.g., ~9x speedup). Automatically falls back to CPU when no CUDA GPU or `-G` flag is specified.
+
+### Build instructions
+
+#### Building with CMake (Recommended with CUDA auto-detection)
+
+```bash
+$ mkdir build && cd build
+$ cmake ..
+$ cmake --build . --config Release
+```
+
+CMake will automatically detect NVIDIA CUDA (`nvcc`) and compile with GPU acceleration enabled. If CUDA is not installed or available, it seamlessly builds the standard CPU version.
+
+#### Building with Make (Linux / MinGW)
+
+```bash
+# Auto-detects nvcc and builds with CUDA if available:
+$ make
+
+# Or build CPU-only explicitly:
+$ make CUDA=0
+```
+
+#### Building with GCC (CPU only)
+
+```bash
+$ gcc gpssim.c -lm -O3 -o gps-sdr-sim
+```
+
+#### Windows MSVC without CMake (CPU only)
 
 1. Start Visual Studio.
 2. Create an empty project for a console application.
-3. On the Solution Explorer at right, add "gpssim.c" and "getopt.c" to the Souce Files folder.
+3. On the Solution Explorer at right, add "gpssim.c" and "getopt.c" to the Source Files folder.
 4. Select "Release" in Solution Configurations drop-down list.
 5. Build the solution.
-
-### Building with GCC
-
-```
-$ gcc gpssim.c -lm -O3 -o gps-sdr-sim
-```
 
 ### Using bigger user motion files
 
@@ -34,22 +62,23 @@ This variable can also be set when compiling directly with GCC:
 $ gcc gpssim.c -lm -O3 -o gps-sdr-sim -DUSER_MOTION_SIZE=4000
 ```
 
-### Generating the GPS signal file
+### Generating the GPS/QZSS signal file
 
 A user-defined trajectory can be specified in either a CSV file, which contains 
 the Earth-centered Earth-fixed (ECEF) user positions, or an NMEA GGA stream.
 The sampling rate of the user motion has to be 10Hz.
 The user is also able to assign a static location directly through the command line.
 
-The user specifies the GPS satellite constellation through a GPS broadcast 
-ephemeris file. The daily GPS broadcast ephemeris file (brdc) is a merge of the
-individual site navigation files into one. The archive for the daily file can 
+The user specifies the satellite constellation through a GPS/GNSS broadcast 
+ephemeris file. The daily GPS/multi-GNSS broadcast ephemeris file (brdc/brdm) is a merge of the
+individual site navigation files into one. The archive for daily files can 
 be downloaded from: https://cddis.nasa.gov/archive/gnss/data/daily/. Access 
-to this site requires registration, which is free.
+to this site requires registration, which is free. RINEX files containing QZSS
+ephemerides (PRN 193-202 / "J" identifier) are also supported.
 
 These files are then used to generate the simulated pseudorange and
-Doppler for the GPS satellites in view. This simulated range data is 
-then used to generate the digitized I/Q samples for the GPS signal.
+Doppler for the satellites in view. This simulated range data is 
+then used to generate the digitized I/Q samples for the signal.
 
 The bladeRF and ADALM-Pluto command line interface requires I/Q pairs stored as signed 
 16-bit integers, while the hackrf_transfer and gps-sdr-sim-uhd.py
@@ -73,7 +102,7 @@ for bladeRF to playback the compressed file.
 ```
 Usage: gps-sdr-sim [options]
 Options:
-  -e <gps_nav>     RINEX navigation file for GPS ephemerides (required)
+  -e <gps_nav>     RINEX navigation file for GPS/QZSS ephemerides (required)
   -u <user_motion> User motion file in ECEF x, y, z format (dynamic mode)
   -x <user_motion> User motion file in lat, lon, height format (dynamic mode)
   -g <nmea_gga>    NMEA GGA stream (dynamic mode)
@@ -89,6 +118,7 @@ Options:
   -i               Disable ionospheric delay for spacecraft scenario
   -p [fixed_gain]  Disable path loss and hold power level constant
   -v               Show details about simulated channels
+  -G               Disable CUDA GPU acceleration and force CPU processing
 ```
 
 The user motion can be specified in either dynamic or static mode:
