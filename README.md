@@ -7,6 +7,7 @@ to RF using software-defined radio (SDR) platforms, such as
 ### Features
 
 - **GPS L1C/A & QZSS L1C/A**: Generates L1C/A signals for GPS (PRN 1–32) and QZSS (PRN 193–202, IS-QZSS-PNT compliant).
+- **Synchronized Dual-Band Architecture (L1 / L5 / DUAL)**: Supports L1 (1575.42 MHz), L5 (1176.45 MHz), and DUAL concurrent synchronized generation with shared orbit, clock, and geometric propagation delay.
 - **RINEX 2 & 3 Navigation Files**: Reads and parses both GPS (`G` prefix) and QZSS (`J` prefix) ephemerides.
 - **CUDA GPU Acceleration**: Fast baseband I/Q sample generation offloaded to NVIDIA CUDA GPUs with double-buffered asynchronous stream pipeline (e.g., ~9x speedup). Automatically falls back to CPU when no CUDA GPU or `-G` flag is specified.
 
@@ -112,9 +113,10 @@ Options:
   -t <date,time>   Scenario start time YYYY/MM/DD,hh:mm:ss
   -T <date,time>   Overwrite TOC and TOE to scenario start time
   -d <duration>    Duration [sec] (dynamic mode max: 300 static mode max: 86400)
-  -o <output>      I/Q sampling data file (default: gpssim.bin ; use - for stdout)
-  -s <frequency>   Sampling frequency [Hz] (default: 2600000)
+  -o <output>      I/Q sampling data file (default: gpssim.bin ; in DUAL mode: <base>_L1.bin and <base>_L5.bin)
+  -s <frequency>   Sampling frequency [Hz] (default: 2.6MHz for L1, 25.0MHz for L5)
   -b <iq_bits>     I/Q data format [1/8/16] (default: 16)
+  -B <band>        Signal band selection: L1, L5, or DUAL (default: L1)
   -i               Disable ionospheric delay for spacecraft scenario
   -p [fixed_gain]  Disable path loss and hold power level constant
   -v               Show details about simulated channels

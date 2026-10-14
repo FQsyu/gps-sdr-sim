@@ -1,6 +1,8 @@
 #ifndef GPSSIM_H
 #define GPSSIM_H
 
+#include <stdio.h>
+
 //#define FLOAT_CARR_PHASE // For RKT simulation. Higher computational load, but smoother carrier phase.
 
 #define TRUE	(1)
@@ -88,13 +90,83 @@ static inline int sat2prn(int sv)
 #define R2D 57.2957795131
 
 #define SPEED_OF_LIGHT 2.99792458e8
-#define LAMBDA_L1 0.190293672798365
 
-/*! \brief GPS L1 Carrier frequency */
-#define CARR_FREQ (1575.42e6)
-/*! \brief C/A code frequency */
-#define CODE_FREQ (1.023e6)
-#define CARR_TO_CODE (1.0/1540.0)
+/* ========================================================================= */
+/* GNSS Band Definitions & Parameters                                        */
+/* ========================================================================= */
+
+typedef enum {
+	BAND_L1 = 0,
+	BAND_L5 = 1,
+	BAND_DUAL = 2
+} gnss_band_t;
+
+/* Carrier Frequencies */
+#define CARR_FREQ_L1 (1575.42e6)
+#define CARR_FREQ_L5 (1176.45e6)
+#define CARR_FREQ    CARR_FREQ_L1 /* Backward compatibility */
+
+/* Chipping Rates */
+#define CODE_FREQ_L1 (1.023e6)
+#define CODE_FREQ_L5 (10.23e6)
+#define CODE_FREQ    CODE_FREQ_L1 /* Backward compatibility */
+
+/* Carrier to Code Ratios */
+#define CARR_TO_CODE_L1 (1.0 / 1540.0)
+#define CARR_TO_CODE_L5 (1.0 / 115.0)
+#define CARR_TO_CODE    CARR_TO_CODE_L1 /* Backward compatibility */
+
+/* Code Sequence Lengths (per 1 ms) */
+#define CA_SEQ_LEN_L1 (1023)
+#define CA_SEQ_LEN_L5 (10230)
+#define MAX_CODE_SEQ_LEN (10230)
+
+/* Carrier Wavelengths */
+#define LAMBDA_L1 0.190293672798365
+#define LAMBDA_L5 (SPEED_OF_LIGHT / CARR_FREQ_L5) /* ~0.254828048790854 */
+
+/* Relative Ionospheric Delay Scale: (f_L1 / f)^2 */
+#define IONO_SCALE_L1 (1.0)
+#define IONO_SCALE_L5 ((CARR_FREQ_L1 * CARR_FREQ_L1) / (CARR_FREQ_L5 * CARR_FREQ_L5)) /* ~1.79327 */
+
+typedef struct {
+	gnss_band_t band;
+	const char *name;           /* "L1" or "L5" */
+	double carr_freq;           /* Carrier frequency [Hz] */
+	double lambda;              /* Carrier wavelength [m] */
+	double code_freq;           /* Code chipping rate [Hz] */
+	double carr_to_code;        /* Ratio: code_freq / carr_freq */
+	int code_seq_len;           /* Code chips per 1 ms (1023 or 10230) */
+	double iono_scale;          /* Relative ionospheric scale factor */
+	double default_samp_freq;   /* Default sampling frequency [Hz] */
+} band_param_t;
+
+static inline band_param_t get_band_param(gnss_band_t band)
+{
+	band_param_t p;
+	if (band == BAND_L5) {
+		p.band = BAND_L5;
+		p.name = "L5";
+		p.carr_freq = CARR_FREQ_L5;
+		p.lambda = LAMBDA_L5;
+		p.code_freq = CODE_FREQ_L5;
+		p.carr_to_code = CARR_TO_CODE_L5;
+		p.code_seq_len = CA_SEQ_LEN_L5;
+		p.iono_scale = IONO_SCALE_L5;
+		p.default_samp_freq = 25.0e6;
+	} else {
+		p.band = BAND_L1;
+		p.name = "L1";
+		p.carr_freq = CARR_FREQ_L1;
+		p.lambda = LAMBDA_L1;
+		p.code_freq = CODE_FREQ_L1;
+		p.carr_to_code = CARR_TO_CODE_L1;
+		p.code_seq_len = CA_SEQ_LEN_L1;
+		p.iono_scale = IONO_SCALE_L1;
+		p.default_samp_freq = 2.6e6;
+	}
+	return p;
+}
 
 // Sampling data format
 #define SC01 (1)
@@ -174,11 +246,13 @@ typedef struct
 typedef struct
 {
 	gpstime_t g;
-	double range; // pseudorange
-	double rate;
-	double d; // geometric distance
-	double azel[2];
-	double iono_delay;
+	double range; /*!< Pseudorange for target band [m] */
+	double rate;  /*!< Pseudorange rate [m/s] */
+	double d;     /*!< Geometric distance [m] */
+	double azel[2]; /*!< Azimuth and elevation [rad] */
+	double iono_delay; /*!< Ionospheric delay for target band [m] */
+	double iono_delay_l1; /*!< Base L1 ionospheric delay [m] */
+	double clk_bias; /*!< SV clock bias c * clk [m] */
 } range_t;
 
 /*! \brief Structure representing a Channel */
@@ -206,5 +280,22 @@ typedef struct
 	double azel[2];
 	range_t rho0;
 } channel_t;
+
+/*! \brief Structure representing a synchronized simulation stream (e.g. L1 or L5) */
+typedef struct
+{
+	gnss_band_t band;
+	band_param_t param;
+	char outfile[MAX_CHAR];
+	FILE *fp;
+	double samp_freq;
+	int iq_buff_size;       /*!< Complex samples per 0.1sec block */
+	double delt;            /*!< 1.0 / samp_freq */
+	short *iq_buff;         /*!< 16-bit complex I/Q buffer */
+	signed char *iq8_buff;  /*!< 8-bit or 1-bit packed buffer */
+	channel_t chan[MAX_CHAN];
+	int gain[MAX_CHAN];
+	int use_cuda;
+} sim_stream_t;
 
 #endif

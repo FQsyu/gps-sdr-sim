@@ -7,8 +7,10 @@
 #include <time.h>
 #ifdef _WIN32
 #include "getopt.h"
+#define STRICMP _stricmp
 #else
 #include <unistd.h>
+#define STRICMP strcasecmp
 #endif
 #include "gpssim.h"
 #ifdef ENABLE_CUDA
@@ -1357,13 +1359,15 @@ double ionosphericDelay(const ionoutc_t *ionoutc, gpstime_t g, double *llh, doub
 	return (iono_delay);
 }
 
-/*! \brief Compute range between a satellite and the receiver
- *  \param[out] rho The computed range
+/*! \brief Compute common geometric range, clock bias, LOS rate, azel and base ionospheric delay
+ *  This calculation is completely shared across bands (L1/L5).
+ *  \param[out] rho The computed common range information
  *  \param[in] eph Ephemeris data of the satellite
- *  \param[in] g GPS time at time of receiving the signal
- *  \param[in] xyz position of the receiver
+ *  \param[in] ionoutc Ionospheric correction parameters
+ *  \param[in] g GPS time at reception
+ *  \param[in] xyz ECEF position of the receiver
  */
-void computeRange(range_t *rho, ephem_t eph, ionoutc_t *ionoutc, gpstime_t g, double xyz[])
+void computeRangeCommon(range_t *rho, ephem_t eph, ionoutc_t *ionoutc, gpstime_t g, const double xyz[])
 {
 	double pos[3],vel[3],clk[2];
 	double los[3];
@@ -1386,7 +1390,7 @@ void computeRange(range_t *rho, ephem_t eph, ionoutc_t *ionoutc, gpstime_t g, do
 	pos[1] -= vel[1]*tau;
 	pos[2] -= vel[2]*tau;
 
-	// Earth rotation correction. The change in velocity can be neglected.
+	// Earth rotation correction (Sagnac effect). The change in velocity can be neglected.
 	xrot = pos[0] + pos[1]*OMEGA_EARTH*tau;
 	yrot = pos[1] - pos[0]*OMEGA_EARTH*tau;
 	pos[0] = xrot;
@@ -1397,13 +1401,11 @@ void computeRange(range_t *rho, ephem_t eph, ionoutc_t *ionoutc, gpstime_t g, do
 	range = normVect(los);
 	rho->d = range;
 
-	// Pseudorange.
-	rho->range = range - SPEED_OF_LIGHT*clk[0];
+	// SV clock bias in meters
+	rho->clk_bias = SPEED_OF_LIGHT*clk[0];
 
 	// Relative velocity of SV and receiver.
 	rate = dotProd(vel, los)/range;
-
-	// Pseudorange rate.
 	rho->rate = rate; // - SPEED_OF_LIGHT*clk[1];
 
 	// Time of application.
@@ -1415,19 +1417,53 @@ void computeRange(range_t *rho, ephem_t eph, ionoutc_t *ionoutc, gpstime_t g, do
 	ecef2neu(los, tmat, neu);
 	neu2azel(rho->azel, neu);
 
-	// Add ionospheric delay
-	rho->iono_delay = ionosphericDelay(ionoutc, g, llh, rho->azel);
-	rho->range += rho->iono_delay;
+	// Base ionospheric delay (L1 equivalent)
+	rho->iono_delay_l1 = ionosphericDelay(ionoutc, g, llh, rho->azel);
 
 	return;
 }
 
-/*! \brief Compute the code phase for a given channel (satellite)
- *  \param chan Channel on which we operate (is updated)
- *  \param[in] rho1 Current range, after \a dt has expired
- *  \param[in dt delta-t (time difference) in seconds
+/*! \brief Derive band-specific pseudorange and ionospheric delay from common geometry
+ *  \param[out] rho The output range structure for the specific band
+ *  \param[in] eph Ephemeris data of the satellite
+ *  \param[in] ionoutc Ionospheric correction parameters
+ *  \param[in] g GPS time at reception
+ *  \param[in] xyz ECEF position of the receiver
+ *  \param[in] band Target GNSS frequency band parameters
  */
-void computeCodePhase(channel_t *chan, range_t rho1, double dt)
+void computeRangeBand(range_t *rho, ephem_t eph, ionoutc_t *ionoutc, gpstime_t g, const double xyz[], const band_param_t *band)
+{
+	computeRangeCommon(rho, eph, ionoutc, g, xyz);
+
+	// Scale ionospheric delay to target band frequency (I proportional to 1/f^2)
+	rho->iono_delay = rho->iono_delay_l1 * band->iono_scale;
+
+	// Pseudorange: rho = geometric_distance - c * clk + iono_delay
+	rho->range = rho->d - rho->clk_bias + rho->iono_delay;
+
+	return;
+}
+
+/*! \brief Compute range between a satellite and the receiver (L1 backward compatibility)
+ *  \param[out] rho The computed range
+ *  \param[in] eph Ephemeris data of the satellite
+ *  \param[in] g GPS time at time of receiving the signal
+ *  \param[in] xyz position of the receiver
+ */
+void computeRange(range_t *rho, ephem_t eph, ionoutc_t *ionoutc, gpstime_t g, double xyz[])
+{
+	band_param_t p = get_band_param(BAND_L1);
+	computeRangeBand(rho, eph, ionoutc, g, xyz, &p);
+	return;
+}
+
+/*! \brief Compute the code phase and carrier frequency for a given channel based on band parameters
+ *  \param chan Channel on which we operate (is updated)
+ *  \param[in] rho1 Current range, after dt has expired
+ *  \param[in] dt delta-t (time difference) in seconds
+ *  \param[in] band Target GNSS frequency band parameters
+ */
+void computeCodePhaseBand(channel_t *chan, range_t rho1, double dt, const band_param_t *band)
 {
 	double ms;
 	int ims;
@@ -1436,15 +1472,15 @@ void computeCodePhase(channel_t *chan, range_t rho1, double dt)
 	// Pseudorange rate.
 	rhorate = (rho1.range - chan->rho0.range)/dt;
 
-	// Carrier and code frequency.
-	chan->f_carr = -rhorate/LAMBDA_L1;
-	chan->f_code = CODE_FREQ + chan->f_carr*CARR_TO_CODE;
+	// Carrier and code frequency scaled to band parameters
+	chan->f_carr = -rhorate/band->lambda;
+	chan->f_code = band->code_freq + chan->f_carr*band->carr_to_code;
 
-	// Initial code phase and data bit counters.
+	// Initial code phase and data bit counters (1 ms period)
 	ms = ((subGpsTime(chan->rho0.g,chan->g0)+6.0) - chan->rho0.range/SPEED_OF_LIGHT)*1000.0;
 
 	ims = (int)ms;
-	chan->code_phase = (ms-(double)ims)*CA_SEQ_LEN; // in chip
+	chan->code_phase = (ms-(double)ims)*(double)band->code_seq_len; // in chips
 
 	chan->iword = ims/600; // 1 word = 30 bits = 600 ms
 	ims -= chan->iword*600;
@@ -1454,12 +1490,30 @@ void computeCodePhase(channel_t *chan, range_t rho1, double dt)
 
 	chan->icode = ims; // 1 code = 1 ms
 
-	chan->codeCA = chan->ca[(int)chan->code_phase]*2-1;
+	int code_idx = (int)chan->code_phase;
+	if (code_idx >= band->code_seq_len)
+		code_idx = band->code_seq_len - 1;
+	else if (code_idx < 0)
+		code_idx = 0;
+
+	chan->codeCA = chan->ca[code_idx % CA_SEQ_LEN_L1]*2-1;
 	chan->dataBit = (int)((chan->dwrd[chan->iword]>>(29-chan->ibit)) & 0x1UL)*2-1;
 
 	// Save current pseudorange
 	chan->rho0 = rho1;
 
+	return;
+}
+
+/*! \brief Compute the code phase for a given channel (satellite) (L1 backward compatibility)
+ *  \param chan Channel on which we operate (is updated)
+ *  \param[in] rho1 Current range, after \a dt has expired
+ *  \param[in dt delta-t (time difference) in seconds
+ */
+void computeCodePhase(channel_t *chan, range_t rho1, double dt)
+{
+	band_param_t p = get_band_param(BAND_L1);
+	computeCodePhaseBand(chan, rho1, dt, &p);
 	return;
 }
 
@@ -1725,15 +1779,13 @@ int checkSatVisibility(ephem_t eph, gpstime_t g, double *xyz, double elvMask, do
 	return (0); // Invisible
 }
 
-int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t grx, double *xyz, double elvMask)
+int allocateChannelBand(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t grx, double *xyz, double elvMask, const band_param_t *band)
 {
 	int nsat=0;
 	int i,sv;
 	double azel[2];
 
 	range_t rho;
-	double ref[3]={0.0};
-	double r_ref,r_xyz;
 	double phase_ini;
 
 	for (sv=0; sv<MAX_SAT; sv++)
@@ -1754,7 +1806,7 @@ int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t 
 						chan[i].azel[0] = azel[0];
 						chan[i].azel[1] = azel[1];
 
-						// C/A code generation
+						// C/A code generation (in step 1, C/A is used)
 						codegen(chan[i].ca, chan[i].prn);
 
 						// Generate subframe
@@ -1764,17 +1816,10 @@ int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t 
 						generateNavMsg(grx, &chan[i], 1);
 
 						// Initialize pseudorange
-						computeRange(&rho, eph[sv], &ionoutc, grx, xyz);
+						computeRangeBand(&rho, eph[sv], &ionoutc, grx, xyz, band);
 						chan[i].rho0 = rho;
 
-						// Initialize carrier phase
-						r_xyz = rho.range;
-
-						computeRange(&rho, eph[sv], &ionoutc, grx, ref);
-						r_ref = rho.range;
-
-						phase_ini = 0.0; // TODO: Must initialize properly
-						//phase_ini = (2.0*r_ref - r_xyz)/LAMBDA_L1;
+						phase_ini = 0.0;
 #ifdef FLOAT_CARR_PHASE
 						chan[i].carr_phase = phase_ini - floor(phase_ini);
 #else
@@ -1790,6 +1835,29 @@ int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t 
 				if (i<MAX_CHAN)
 					allocatedSat[sv] = i;
 			}
+			else
+			{
+				// Satellite already allocated in slot allocatedSat[sv]
+				i = allocatedSat[sv];
+				if (chan[i].prn == 0)
+				{
+					chan[i].prn = sat2prn(sv);
+					chan[i].azel[0] = azel[0];
+					chan[i].azel[1] = azel[1];
+					codegen(chan[i].ca, chan[i].prn);
+					eph2sbf(eph[sv], ionoutc, chan[i].sbf);
+					generateNavMsg(grx, &chan[i], 1);
+					computeRangeBand(&rho, eph[sv], &ionoutc, grx, xyz, band);
+					chan[i].rho0 = rho;
+					phase_ini = 0.0;
+#ifdef FLOAT_CARR_PHASE
+					chan[i].carr_phase = phase_ini - floor(phase_ini);
+#else
+					phase_ini -= floor(phase_ini);
+					chan[i].carr_phase = (unsigned int)(512.0 * 65536.0 * phase_ini);
+#endif
+				}
+			}
 		}
 		else if (allocatedSat[sv]>=0) // Not visible but allocated
 		{
@@ -1804,11 +1872,321 @@ int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t 
 	return(nsat);
 }
 
+int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t grx, double *xyz, double elvMask)
+{
+	band_param_t p = get_band_param(BAND_L1);
+	return allocateChannelBand(chan, eph, ionoutc, grx, xyz, elvMask, &p);
+}
+
+void generateDualFilenames(const char *base, char *out_l1, char *out_l5)
+{
+	char name[MAX_CHAR];
+	char ext[MAX_CHAR];
+	const char *dot = strrchr(base, '.');
+
+	if (dot != NULL)
+	{
+		size_t len = dot - base;
+		if (len >= MAX_CHAR - 10) len = MAX_CHAR - 10;
+		strncpy(name, base, len);
+		name[len] = '\0';
+		strncpy(ext, dot, MAX_CHAR - 1);
+		ext[MAX_CHAR - 1] = '\0';
+		snprintf(out_l1, MAX_CHAR, "%s_L1%s", name, ext);
+		snprintf(out_l5, MAX_CHAR, "%s_L5%s", name, ext);
+	}
+	else
+	{
+		snprintf(out_l1, MAX_CHAR, "%s_L1.bin", base);
+		snprintf(out_l5, MAX_CHAR, "%s_L5.bin", base);
+	}
+}
+
+int initSimStream(sim_stream_t *stream, gnss_band_t band, double samp_freq, int data_format, const char *outfile, int use_cuda)
+{
+	stream->band = band;
+	stream->param = get_band_param(band);
+
+	if (samp_freq <= 0.0)
+		stream->samp_freq = stream->param.default_samp_freq;
+	else
+		stream->samp_freq = samp_freq;
+
+	// Buffer size for 0.1s block
+	stream->samp_freq = floor(stream->samp_freq / 10.0);
+	stream->iq_buff_size = (int)stream->samp_freq;
+	stream->samp_freq *= 10.0;
+	stream->delt = 1.0 / stream->samp_freq;
+
+	strncpy(stream->outfile, outfile, MAX_CHAR - 1);
+	stream->outfile[MAX_CHAR - 1] = '\0';
+
+	// Allocate I/Q buffer (16-bit)
+	stream->iq_buff = (short *)calloc(2 * stream->iq_buff_size, sizeof(short));
+	if (stream->iq_buff == NULL)
+	{
+		fprintf(stderr, "ERROR [%s]: Failed to allocate 16-bit I/Q buffer (%d samples).\n",
+			stream->param.name, stream->iq_buff_size);
+		return -1;
+	}
+
+	if (data_format == SC08)
+	{
+		stream->iq8_buff = (signed char *)calloc(2 * stream->iq_buff_size, 1);
+		if (stream->iq8_buff == NULL)
+		{
+			fprintf(stderr, "ERROR [%s]: Failed to allocate 8-bit I/Q buffer.\n", stream->param.name);
+			return -1;
+		}
+	}
+	else if (data_format == SC01)
+	{
+		stream->iq8_buff = (signed char *)calloc(stream->iq_buff_size / 4, 1);
+		if (stream->iq8_buff == NULL)
+		{
+			fprintf(stderr, "ERROR [%s]: Failed to allocate compressed 1-bit I/Q buffer.\n", stream->param.name);
+			return -1;
+		}
+	}
+	else
+	{
+		stream->iq8_buff = NULL;
+	}
+
+	// Open output file
+	if (strcmp("-", stream->outfile) != 0)
+	{
+		if (NULL == (stream->fp = fopen(stream->outfile, "wb")))
+		{
+			fprintf(stderr, "ERROR [%s]: Failed to open output file '%s'.\n", stream->param.name, stream->outfile);
+			return -1;
+		}
+	}
+	else
+	{
+		stream->fp = stdout;
+	}
+
+	// Clear channels
+	for (int i = 0; i < MAX_CHAN; i++)
+	{
+		stream->chan[i].prn = 0;
+		stream->gain[i] = 0;
+	}
+
+	stream->use_cuda = use_cuda;
+#ifdef ENABLE_CUDA
+	if (stream->use_cuda)
+	{
+		if (cuda_init_simulator(stream->iq_buff_size, data_format) < 0)
+		{
+			fprintf(stderr, "CUDA initialization failed for [%s], falling back to CPU.\n", stream->param.name);
+			stream->use_cuda = FALSE;
+		}
+	}
+#else
+	stream->use_cuda = FALSE;
+#endif
+
+	return 0;
+}
+
+void freeSimStream(sim_stream_t *stream)
+{
+	if (stream->iq_buff != NULL)
+	{
+		free(stream->iq_buff);
+		stream->iq_buff = NULL;
+	}
+	if (stream->iq8_buff != NULL)
+	{
+		free(stream->iq8_buff);
+		stream->iq8_buff = NULL;
+	}
+	if (stream->fp != NULL && stream->fp != stdout)
+	{
+		fclose(stream->fp);
+		stream->fp = NULL;
+	}
+}
+
+void updateChannelStream(
+	sim_stream_t *stream,
+	ephem_t *eph,
+	ionoutc_t ionoutc,
+	gpstime_t grx,
+	const double xyz[3],
+	int path_loss_enable,
+	int fixed_gain,
+	const double ant_pat[37]
+)
+{
+	int i, sv, ibs;
+	double path_loss, ant_gain;
+	range_t rho;
+
+	for (i = 0; i < MAX_CHAN; i++)
+	{
+		if (stream->chan[i].prn > 0)
+		{
+			sv = prn2sat(stream->chan[i].prn);
+
+			// Current pseudorange for this band
+			computeRangeBand(&rho, eph[sv], &ionoutc, grx, xyz, &stream->param);
+
+			stream->chan[i].azel[0] = rho.azel[0];
+			stream->chan[i].azel[1] = rho.azel[1];
+
+			// Update code phase and carrier frequency
+			computeCodePhaseBand(&stream->chan[i], rho, 0.1, &stream->param);
+
+#ifndef FLOAT_CARR_PHASE
+			stream->chan[i].carr_phasestep = (int)round(512.0 * 65536.0 * stream->chan[i].f_carr * stream->delt);
+#endif
+			// Path loss
+			path_loss = 20200000.0 / rho.d;
+
+			// Receiver antenna gain
+			ibs = (int)((90.0 - rho.azel[1] * R2D) / 5.0);
+			if (ibs < 0) ibs = 0;
+			if (ibs > 36) ibs = 36;
+			ant_gain = ant_pat[ibs];
+
+			if (path_loss_enable == TRUE)
+				stream->gain[i] = (int)(path_loss * ant_gain * 128.0);
+			else
+				stream->gain[i] = fixed_gain;
+		}
+	}
+}
+
+void generateSamplesStream(sim_stream_t *stream, int data_format, int iumd, int numd)
+{
+#ifdef ENABLE_CUDA
+	if (stream->use_cuda)
+	{
+		if (iumd > 1)
+		{
+			void *out_ptr = NULL;
+			size_t out_bytes = 0;
+			cuda_sync_and_get_output(&out_ptr, &out_bytes, iumd - 1);
+			fwrite(out_ptr, 1, out_bytes, stream->fp);
+		}
+
+		cuda_queue_block(stream->chan, MAX_CHAN, stream->gain, stream->delt, iumd);
+
+		for (int i = 0; i < MAX_CHAN; i++)
+		{
+			if (stream->chan[i].prn > 0)
+			{
+				stream->chan[i].carr_phase += (unsigned int)stream->iq_buff_size * (unsigned int)stream->chan[i].carr_phasestep;
+			}
+		}
+		return;
+	}
+#endif
+
+	// CPU sample generation
+	for (int isamp = 0; isamp < stream->iq_buff_size; isamp++)
+	{
+		int i_acc = 0;
+		int q_acc = 0;
+
+		for (int i = 0; i < MAX_CHAN; i++)
+		{
+			if (stream->chan[i].prn > 0)
+			{
+#ifdef FLOAT_CARR_PHASE
+				int iTable = (int)floor(stream->chan[i].carr_phase * 512.0);
+#else
+				int iTable = (stream->chan[i].carr_phase >> 16) & 0x1ff;
+#endif
+				int ip = stream->chan[i].dataBit * stream->chan[i].codeCA * cosTable512[iTable] * stream->gain[i];
+				int qp = stream->chan[i].dataBit * stream->chan[i].codeCA * sinTable512[iTable] * stream->gain[i];
+
+				i_acc += ip;
+				q_acc += qp;
+
+				// Update code phase
+				stream->chan[i].code_phase += stream->chan[i].f_code * stream->delt;
+
+				if (stream->chan[i].code_phase >= stream->param.code_seq_len)
+				{
+					stream->chan[i].code_phase -= stream->param.code_seq_len;
+					stream->chan[i].icode++;
+
+					if (stream->chan[i].icode >= 20)
+					{
+						stream->chan[i].icode = 0;
+						stream->chan[i].ibit++;
+
+						if (stream->chan[i].ibit >= 30)
+						{
+							stream->chan[i].ibit = 0;
+							stream->chan[i].iword++;
+						}
+
+						stream->chan[i].dataBit = (int)((stream->chan[i].dwrd[stream->chan[i].iword] >> (29 - stream->chan[i].ibit)) & 0x1UL) * 2 - 1;
+					}
+				}
+
+				int code_idx = (int)stream->chan[i].code_phase;
+				if (code_idx >= stream->param.code_seq_len)
+					code_idx = stream->param.code_seq_len - 1;
+				else if (code_idx < 0)
+					code_idx = 0;
+
+				stream->chan[i].codeCA = stream->chan[i].ca[code_idx % CA_SEQ_LEN_L1] * 2 - 1;
+
+#ifdef FLOAT_CARR_PHASE
+				stream->chan[i].carr_phase += stream->chan[i].f_carr * stream->delt;
+				if (stream->chan[i].carr_phase >= 1.0)
+					stream->chan[i].carr_phase -= 1.0;
+				else if (stream->chan[i].carr_phase < 0.0)
+					stream->chan[i].carr_phase += 1.0;
+#else
+				stream->chan[i].carr_phase += stream->chan[i].carr_phasestep;
+#endif
+			}
+		}
+
+		i_acc = (i_acc + 64) >> 7;
+		q_acc = (q_acc + 64) >> 7;
+
+		stream->iq_buff[isamp * 2] = (short)i_acc;
+		stream->iq_buff[isamp * 2 + 1] = (short)q_acc;
+	}
+
+	if (data_format == SC01)
+	{
+		for (int isamp = 0; isamp < 2 * stream->iq_buff_size; isamp++)
+		{
+			if (isamp % 8 == 0)
+				stream->iq8_buff[isamp / 8] = 0x00;
+
+			stream->iq8_buff[isamp / 8] |= (stream->iq_buff[isamp] > 0 ? 0x01 : 0x00) << (7 - isamp % 8);
+		}
+		fwrite(stream->iq8_buff, 1, stream->iq_buff_size / 4, stream->fp);
+	}
+	else if (data_format == SC08)
+	{
+		for (int isamp = 0; isamp < 2 * stream->iq_buff_size; isamp++)
+		{
+			stream->iq8_buff[isamp] = stream->iq_buff[isamp] >> 4;
+		}
+		fwrite(stream->iq8_buff, 1, 2 * stream->iq_buff_size, stream->fp);
+	}
+	else
+	{
+		fwrite(stream->iq_buff, 2, 2 * stream->iq_buff_size, stream->fp);
+	}
+}
+
 void usage(void)
 {
 	fprintf(stderr, "Usage: gps-sdr-sim [options]\n"
 		"Options:\n"
-		"  -e <gps_nav>     RINEX navigation file for GPS ephemerides (required)\n"
+		"  -e <gps_nav>     RINEX navigation file for GPS/QZSS ephemerides (required)\n"
 		"  -u <user_motion> User motion file in ECEF x, y, z format (dynamic mode)\n"
 		"  -x <user_motion> User motion file in lat, lon, height format (dynamic mode)\n"
 		"  -g <nmea_gga>    NMEA GGA stream (dynamic mode)\n"
@@ -1818,9 +2196,10 @@ void usage(void)
 		"  -t <date,time>   Scenario start time YYYY/MM/DD,hh:mm:ss\n"
 		"  -T <date,time>   Overwrite TOC and TOE to scenario start time\n"
 		"  -d <duration>    Duration [sec] (dynamic mode max: %.0f, static mode max: %d)\n"
-		"  -o <output>      I/Q sampling data file (default: gpssim.bin)\n"
-		"  -s <frequency>   Sampling frequency [Hz] (default: 2600000)\n"
+		"  -o <output>      I/Q sampling data file (default: gpssim.bin ; in DUAL mode: <base>_L1.bin and <base>_L5.bin)\n"
+		"  -s <frequency>   Sampling frequency [Hz] (default: 2.6MHz for L1, 25.0MHz for L5)\n"
 		"  -b <iq_bits>     I/Q data format [1/8/16] (default: 16)\n"
+		"  -B <band>        Signal band selection: L1, L5, or DUAL (default: L1)\n"
 		"  -i               Disable ionospheric delay for spacecraft scenario\n"
 		"  -p [fixed_gain]  Disable path loss and hold power level constant\n"
 		"  -v               Show details about simulated channels\n"
@@ -1837,8 +2216,6 @@ int main(int argc, char *argv[])
 {
 	clock_t tstart,tend;
 
-	FILE *fp;
-
 	int sv;
 	int neph,ieph;
 	ephem_t eph[EPHEM_ARRAY_SIZE][MAX_SAT];
@@ -1847,13 +2224,7 @@ int main(int argc, char *argv[])
 	double llh[3];
 
 	int i;
-	channel_t chan[MAX_CHAN];
 	double elvmask = 0.0; // in degree
-
-	int ip,qp;
-	int iTable;
-	short *iq_buff = NULL;
-	signed char *iq8_buff = NULL;
 
 #ifdef ENABLE_CUDA
 	int use_cuda = TRUE;
@@ -1862,33 +2233,27 @@ int main(int argc, char *argv[])
 #endif
 
 	gpstime_t grx;
-	double delt;
-	int isamp;
 
 	int iumd;
 	int numd;
 	char umfile[MAX_CHAR];
 
-
 	int staticLocationMode = FALSE;
+	int staticECEFMode = FALSE;
 	int nmeaGGA = FALSE;
 	int umLLH = FALSE;
 
 	char navfile[MAX_CHAR];
 	char outfile[MAX_CHAR];
 
-	double samp_freq;
-	int iq_buff_size;
+	gnss_band_t band_mode = BAND_L1;
+	double user_samp_freq = -1.0;
 	int data_format;
 
 	int result;
 
-	int gain[MAX_CHAN];
-	double path_loss;
-	double ant_gain;
 	int fixed_gain = 128;
 	double ant_pat[37];
-	int ibs; // boresight angle index
 
 	datetime_t t0,tmin,tmax;
 	gpstime_t gmin,gmax;
@@ -1911,8 +2276,7 @@ int main(int argc, char *argv[])
 	// Default options
 	navfile[0] = 0;
 	umfile[0] = 0;
-	strcpy(outfile, "gpssim.bin");
-	samp_freq = 2.6e6;
+	outfile[0] = 0;
 	data_format = SC16;
 	g0.week = -1; // Invalid start time
 	iduration = USER_MOTION_SIZE;
@@ -1927,7 +2291,7 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	while ((result=getopt(argc,argv,"e:u:x:g:c:l:o:s:b:L:T:t:d:ipvG"))!=-1)
+	while ((result=getopt(argc,argv,"e:u:x:g:c:l:o:s:b:B:L:T:t:d:ipvG"))!=-1)
 	{
 		switch (result)
 		{
@@ -1936,6 +2300,19 @@ int main(int argc, char *argv[])
 			use_cuda = FALSE;
 			break;
 #endif
+		case 'B':
+			if (STRICMP(optarg, "L1") == 0)
+				band_mode = BAND_L1;
+			else if (STRICMP(optarg, "L5") == 0)
+				band_mode = BAND_L5;
+			else if (STRICMP(optarg, "DUAL") == 0)
+				band_mode = BAND_DUAL;
+			else
+			{
+				fprintf(stderr, "ERROR: Invalid signal band '%s'. Valid options are L1, L5, or DUAL.\n", optarg);
+				exit(1);
+			}
+			break;
 		case 'e':
 			strcpy(navfile, optarg);
 			break;
@@ -1956,6 +2333,7 @@ int main(int argc, char *argv[])
 		case 'c':
 			// Static ECEF coordinates input mode
 			staticLocationMode = TRUE;
+			staticECEFMode = TRUE;
 			sscanf(optarg,"%lf,%lf,%lf",&xyz[0][0],&xyz[0][1],&xyz[0][2]);
 			break;
 		case 'l':
@@ -1971,10 +2349,10 @@ int main(int argc, char *argv[])
 			strcpy(outfile, optarg);
 			break;
 		case 's':
-			samp_freq = atof(optarg);
-			if (samp_freq<1.0e6)
+			user_samp_freq = atof(optarg);
+			if (user_samp_freq < 1.0e6 || user_samp_freq > 100.0e6)
 			{
-				fprintf(stderr, "ERROR: Invalid sampling frequency.\n");
+				fprintf(stderr, "ERROR: Invalid sampling frequency. Must be between 1.0 MHz and 100.0 MHz.\n");
 				exit(1);
 			}
 			break;
@@ -2075,6 +2453,15 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
+	// Default output file if not set
+	if (outfile[0] == 0)
+	{
+		if (band_mode == BAND_L5)
+			strcpy(outfile, "gpssim_L5.bin");
+		else
+			strcpy(outfile, "gpssim.bin");
+	}
+
 	if (umfile[0]==0 && !staticLocationMode)
 	{
 		// Default static location; Tokyo
@@ -2090,13 +2477,6 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 	iduration = (int)(duration*10.0 + 0.5);
-
-	// Buffer size
-	samp_freq = floor(samp_freq/10.0);
-	iq_buff_size = (int)samp_freq; // samples per 0.1sec
-	samp_freq *= 10.0;
-
-	delt = 1.0/samp_freq;
 
 	////////////////////////////////////////////////////////////
 	// Receiver position
@@ -2132,15 +2512,17 @@ int main(int argc, char *argv[])
 	}
 	else
 	{
-		// Static geodetic coordinates input mode: "-l"
-		// Added by scateu@gmail.com
+		// Static location mode ("-c" or "-l" or default)
 		fprintf(stderr, "Using static location mode.\n");
 
 		// Set simulation duration
 		numd = iduration;
 
 		// Set user initial position
-		llh2xyz(llh, xyz[0]);
+		if (staticECEFMode)
+			xyz2llh(xyz[0], llh);
+		else
+			llh2xyz(llh, xyz[0]);
 	}
 
 	fprintf(stderr, "xyz = %11.1f, %11.1f, %11.1f\n", xyz[0][0], xyz[0][1], xyz[0][2]);
@@ -2294,91 +2676,86 @@ int main(int argc, char *argv[])
 	}
 
 	////////////////////////////////////////////////////////////
-	// Baseband signal buffer and output file
+	// Baseband signal stream initialization
 	////////////////////////////////////////////////////////////
 
-	// Allocate I/Q buffer
-	iq_buff = calloc(2*iq_buff_size, 2);
+	int num_streams = 0;
+	sim_stream_t streams[2];
 
-	if (iq_buff==NULL)
+	if (band_mode == BAND_DUAL)
 	{
-		fprintf(stderr, "ERROR: Failed to allocate 16-bit I/Q buffer.\n");
-		exit(1);
-	}
-
-	if (data_format==SC08)
-	{
-		iq8_buff = calloc(2*iq_buff_size, 1);
-		if (iq8_buff==NULL)
+		if (strcmp("-", outfile) == 0)
 		{
-			fprintf(stderr, "ERROR: Failed to allocate 8-bit I/Q buffer.\n");
+			fprintf(stderr, "ERROR: DUAL band mode does not support stdout. Please specify an output file name.\n");
 			exit(1);
 		}
-	}
-	else if (data_format==SC01)
-	{
-		iq8_buff = calloc(iq_buff_size/4, 1); // byte = {I0, Q0, I1, Q1, I2, Q2, I3, Q3}
-		if (iq8_buff==NULL)
-		{
-			fprintf(stderr, "ERROR: Failed to allocate compressed 1-bit I/Q buffer.\n");
-			exit(1);
-		}
-	}
+		num_streams = 2;
+		char out_l1[MAX_CHAR], out_l5[MAX_CHAR];
+		generateDualFilenames(outfile, out_l1, out_l5);
 
-	// Open output file
-	// "-" can be used as name for stdout
-	if(strcmp("-", outfile)){
-		if (NULL==(fp=fopen(outfile,"wb")))
-		{
-			fprintf(stderr, "ERROR: Failed to open output file.\n");
-			exit(1);
-		}
-	}else{
-		fp = stdout;
-	}
+		double sf_l1 = (user_samp_freq > 0.0) ? user_samp_freq : 2.6e6;
+		double sf_l5 = (user_samp_freq > 0.0) ? user_samp_freq : 25.0e6;
 
-#ifdef ENABLE_CUDA
-	if (use_cuda)
-	{
-		if (cuda_init_simulator(iq_buff_size, data_format) < 0)
-		{
-			fprintf(stderr, "CUDA initialization failed, falling back to CPU.\n");
-			use_cuda = FALSE;
-		}
+		fprintf(stderr, "DUAL band mode enabled:\n");
+		fprintf(stderr, "  L1 stream: %s (%.2f MSps)\n", out_l1, sf_l1 / 1.0e6);
+		fprintf(stderr, "  L5 stream: %s (%.2f MSps)\n", out_l5, sf_l5 / 1.0e6);
+
+		if (initSimStream(&streams[0], BAND_L1, sf_l1, data_format, out_l1, use_cuda) < 0)
+			exit(1);
+		if (initSimStream(&streams[1], BAND_L5, sf_l5, data_format, out_l5, FALSE) < 0)
+			exit(1);
 	}
-#endif
+	else if (band_mode == BAND_L5)
+	{
+		num_streams = 1;
+		double sf_l5 = (user_samp_freq > 0.0) ? user_samp_freq : 25.0e6;
+		fprintf(stderr, "L5 band mode enabled: %s (%.2f MSps)\n", outfile, sf_l5 / 1.0e6);
+		if (initSimStream(&streams[0], BAND_L5, sf_l5, data_format, outfile, use_cuda) < 0)
+			exit(1);
+	}
+	else // BAND_L1
+	{
+		num_streams = 1;
+		double sf_l1 = (user_samp_freq > 0.0) ? user_samp_freq : 2.6e6;
+		fprintf(stderr, "L1 band mode enabled: %s (%.2f MSps)\n", outfile, sf_l1 / 1.0e6);
+		if (initSimStream(&streams[0], BAND_L1, sf_l1, data_format, outfile, use_cuda) < 0)
+			exit(1);
+	}
 
 	////////////////////////////////////////////////////////////
 	// Initialize channels
 	////////////////////////////////////////////////////////////
 
-	// Clear all channels
-	for (i=0; i<MAX_CHAN; i++)
-		chan[i].prn = 0;
-
 	// Clear satellite allocation flag
-	for (sv=0; sv<MAX_SAT; sv++)
+	for (sv = 0; sv < MAX_SAT; sv++)
 		allocatedSat[sv] = -1;
 
-	// Initial reception time
+	// Initial reception time (shared across all streams)
 	grx = incGpsTime(g0, 0.0);
 
-	// Allocate visible satellites
-	allocateChannel(chan, eph[ieph], ionoutc, grx, xyz[0], elvmask);
-
-	for(i=0; i<MAX_CHAN; i++)
+	for (int s = 0; s < num_streams; s++)
 	{
-		if (chan[i].prn>0)
-			fprintf(stderr, "%02d %6.1f %5.1f %11.1f %5.1f\n", chan[i].prn,
-				chan[i].azel[0]*R2D, chan[i].azel[1]*R2D, chan[i].rho0.d, chan[i].rho0.iono_delay);
+		allocateChannelBand(streams[s].chan, eph[ieph], ionoutc, grx, xyz[0], elvmask, &streams[s].param);
+		fprintf(stderr, "\n--- %s Initial Channels ---\n", streams[s].param.name);
+		for (i = 0; i < MAX_CHAN; i++)
+		{
+			if (streams[s].chan[i].prn > 0)
+				fprintf(stderr, "%02d %6.1f %5.1f %11.1f %5.1f (f_carr: %+.1f Hz)\n",
+					streams[s].chan[i].prn,
+					streams[s].chan[i].azel[0] * R2D,
+					streams[s].chan[i].azel[1] * R2D,
+					streams[s].chan[i].rho0.d,
+					streams[s].chan[i].rho0.iono_delay,
+					streams[s].chan[i].f_carr);
+		}
 	}
 
 	////////////////////////////////////////////////////////////
 	// Receiver antenna gain pattern
 	////////////////////////////////////////////////////////////
 
-	for (i=0; i<37; i++)
-		ant_pat[i] = pow(10.0, -ant_pat_db[i]/20.0);
+	for (i = 0; i < 37; i++)
+		ant_pat[i] = pow(10.0, -ant_pat_db[i] / 20.0);
 
 	////////////////////////////////////////////////////////////
 	// Generate baseband signals
@@ -2389,227 +2766,80 @@ int main(int argc, char *argv[])
 	// Update receiver time
 	grx = incGpsTime(grx, 0.1);
 
-	for (iumd=1; iumd<numd; iumd++)
+	for (iumd = 1; iumd < numd; iumd++)
 	{
-		for (i=0; i<MAX_CHAN; i++)
+		const double *cur_xyz = staticLocationMode ? xyz[0] : xyz[iumd];
+
+		// Synchronized tracking update for each stream
+		for (int s = 0; s < num_streams; s++)
 		{
-			if (chan[i].prn>0)
-			{
-				// Refresh code phase and data bit counters
-				range_t rho;
-				sv = prn2sat(chan[i].prn);
-
-				// Current pseudorange
-				if (!staticLocationMode)
-					computeRange(&rho, eph[ieph][sv], &ionoutc, grx, xyz[iumd]);
-				else
-					computeRange(&rho, eph[ieph][sv], &ionoutc, grx, xyz[0]);
-
-				chan[i].azel[0] = rho.azel[0];
-				chan[i].azel[1] = rho.azel[1];
-
-				// Update code phase and data bit counters
-				computeCodePhase(&chan[i], rho, 0.1);
-#ifndef FLOAT_CARR_PHASE
-				chan[i].carr_phasestep = (int)round(512.0 * 65536.0 * chan[i].f_carr * delt);
-#endif
-				// Path loss
-				path_loss = 20200000.0/rho.d;
-
-				// Receiver antenna gain
-				ibs = (int)((90.0-rho.azel[1]*R2D)/5.0); // covert elevation to boresight
-				ant_gain = ant_pat[ibs];
-
-				// Signal gain
-				if (path_loss_enable == TRUE)
-					gain[i] = (int)(path_loss * ant_gain * 128.0); // scaled by 2^7
-				else
-					gain[i] = fixed_gain; // hold the power level constant
-			}
+			updateChannelStream(&streams[s], eph[ieph], ionoutc, grx, cur_xyz,
+			                    path_loss_enable, fixed_gain, ant_pat);
 		}
 
-#ifdef ENABLE_CUDA
-		if (use_cuda)
+		// Synchronized IQ sample block generation (0.1s block)
+		for (int s = 0; s < num_streams; s++)
 		{
-			if (iumd > 1)
-			{
-				void *out_ptr = NULL;
-				size_t out_bytes = 0;
-				cuda_sync_and_get_output(&out_ptr, &out_bytes, iumd - 1);
-				fwrite(out_ptr, 1, out_bytes, fp);
-			}
-
-			cuda_queue_block(chan, MAX_CHAN, gain, delt, iumd);
-
-			// Advance carrier phase for the simulated 0.1s interval
-			for (i = 0; i < MAX_CHAN; i++)
-			{
-				if (chan[i].prn > 0)
-				{
-					chan[i].carr_phase += (unsigned int)iq_buff_size * (unsigned int)chan[i].carr_phasestep;
-				}
-			}
-		}
-		else
-#endif
-		{
-			for (isamp=0; isamp<iq_buff_size; isamp++)
-			{
-				int i_acc = 0;
-				int q_acc = 0;
-
-				for (i=0; i<MAX_CHAN; i++)
-				{
-					if (chan[i].prn>0)
-					{
-#ifdef FLOAT_CARR_PHASE
-						iTable = (int)floor(chan[i].carr_phase*512.0);
-#else
-						iTable = (chan[i].carr_phase >> 16) & 0x1ff; // 9-bit index
-#endif
-						ip = chan[i].dataBit * chan[i].codeCA * cosTable512[iTable] * gain[i];
-						qp = chan[i].dataBit * chan[i].codeCA * sinTable512[iTable] * gain[i];
-
-						// Accumulate for all visible satellites
-						i_acc += ip;
-						q_acc += qp;
-
-						// Update code phase
-						chan[i].code_phase += chan[i].f_code * delt;
-
-						if (chan[i].code_phase>=CA_SEQ_LEN)
-						{
-							chan[i].code_phase -= CA_SEQ_LEN;
-
-							chan[i].icode++;
-
-							if (chan[i].icode>=20) // 20 C/A codes = 1 navigation data bit
-							{
-								chan[i].icode = 0;
-								chan[i].ibit++;
-
-								if (chan[i].ibit>=30) // 30 navigation data bits = 1 word
-								{
-									chan[i].ibit = 0;
-									chan[i].iword++;
-									/*
-									if (chan[i].iword>=N_DWRD)
-										fprintf(stderr, "\nWARNING: Subframe word buffer overflow.\n");
-									*/
-								}
-
-								// Set new navigation data bit
-								chan[i].dataBit = (int)((chan[i].dwrd[chan[i].iword]>>(29-chan[i].ibit)) & 0x1UL)*2-1;
-							}
-						}
-
-						// Set current code chip
-						chan[i].codeCA = chan[i].ca[(int)chan[i].code_phase]*2-1;
-
-						// Update carrier phase
-#ifdef FLOAT_CARR_PHASE
-						chan[i].carr_phase += chan[i].f_carr * delt;
-
-						if (chan[i].carr_phase >= 1.0)
-							chan[i].carr_phase -= 1.0;
-						else if (chan[i].carr_phase<0.0)
-							chan[i].carr_phase += 1.0;
-#else
-						chan[i].carr_phase += chan[i].carr_phasestep;
-#endif
-					}
-				}
-
-				// Scaled by 2^7
-				i_acc = (i_acc+64)>>7;
-				q_acc = (q_acc+64)>>7;
-
-				// Store I/Q samples into buffer
-				iq_buff[isamp*2] = (short)i_acc;
-				iq_buff[isamp*2+1] = (short)q_acc;
-			}
-
-			if (data_format==SC01)
-			{
-				for (isamp=0; isamp<2*iq_buff_size; isamp++)
-				{
-					if (isamp%8==0)
-						iq8_buff[isamp/8] = 0x00;
-
-					iq8_buff[isamp/8] |= (iq_buff[isamp]>0?0x01:0x00)<<(7-isamp%8);
-				}
-
-				fwrite(iq8_buff, 1, iq_buff_size/4, fp);
-			}
-			else if (data_format==SC08)
-			{
-				for (isamp=0; isamp<2*iq_buff_size; isamp++)
-				{
-					iq8_buff[isamp] = iq_buff[isamp]>>4; // 12-bit bladeRF -> 8-bit HackRF
-					//iq8_buff[isamp] = iq_buff[isamp] >> 8; // for PocketSDR
-				}
-
-				fwrite(iq8_buff, 1, 2*iq_buff_size, fp);
-			}
-			else // data_format==SC16
-			{
-				fwrite(iq_buff, 2, 2*iq_buff_size, fp);
-			}
+			generateSamplesStream(&streams[s], data_format, iumd, numd);
 		}
 
-		//
 		// Update navigation message and channel allocation every 30 seconds
-		//
+		igrx = (int)(grx.sec * 10.0 + 0.5);
 
-		igrx = (int)(grx.sec*10.0+0.5);
-
-		if (igrx%300==0) // Every 30 seconds
+		if (igrx % 300 == 0) // Every 30 seconds
 		{
-			// Update navigation message
-			for (i=0; i<MAX_CHAN; i++)
-			{
-				if (chan[i].prn>0)
-					generateNavMsg(grx, &chan[i], 0);
-			}
-
 			// Refresh ephemeris and subframes
-			// Quick and dirty fix. Need more elegant way.
-			for (sv=0; sv<MAX_SAT; sv++)
+			for (sv = 0; sv < MAX_SAT; sv++)
 			{
-				if (eph[ieph+1][sv].vflg==1)
+				if (eph[ieph+1][sv].vflg == 1)
 				{
 					dt = subGpsTime(eph[ieph+1][sv].toc, grx);
-					if (dt<SECONDS_IN_HOUR)
+					if (dt < SECONDS_IN_HOUR)
 					{
 						ieph++;
-
-						for (i=0; i<MAX_CHAN; i++)
+						for (int s = 0; s < num_streams; s++)
 						{
-							// Generate new subframes if allocated
-							if (chan[i].prn!=0)
-								eph2sbf(eph[ieph][prn2sat(chan[i].prn)], ionoutc, chan[i].sbf);
+							for (i = 0; i < MAX_CHAN; i++)
+							{
+								if (streams[s].chan[i].prn != 0)
+									eph2sbf(eph[ieph][prn2sat(streams[s].chan[i].prn)], ionoutc, streams[s].chan[i].sbf);
+							}
 						}
 					}
-
 					break;
 				}
 			}
 
-			// Update channel allocation
-			if (!staticLocationMode)
-				allocateChannel(chan, eph[ieph], ionoutc, grx, xyz[iumd], elvmask);
-			else
-				allocateChannel(chan, eph[ieph], ionoutc, grx, xyz[0], elvmask);
+			// Update navigation message & channel allocation
+			for (int s = 0; s < num_streams; s++)
+			{
+				for (i = 0; i < MAX_CHAN; i++)
+				{
+					if (streams[s].chan[i].prn > 0)
+						generateNavMsg(grx, &streams[s].chan[i], 0);
+				}
+
+				allocateChannelBand(streams[s].chan, eph[ieph], ionoutc, grx, (double *)cur_xyz, elvmask, &streams[s].param);
+			}
 
 			// Show details about simulated channels
-			if (verb==TRUE)
+			if (verb == TRUE)
 			{
 				fprintf(stderr, "\n");
-				for (i=0; i<MAX_CHAN; i++)
+				for (int s = 0; s < num_streams; s++)
 				{
-					if (chan[i].prn>0)
-						fprintf(stderr, "%02d %6.1f %5.1f %11.1f %5.1f\n", chan[i].prn,
-							chan[i].azel[0]*R2D, chan[i].azel[1]*R2D, chan[i].rho0.d, chan[i].rho0.iono_delay);
+					fprintf(stderr, "[%s channels]\n", streams[s].param.name);
+					for (i = 0; i < MAX_CHAN; i++)
+					{
+						if (streams[s].chan[i].prn > 0)
+							fprintf(stderr, "%02d %6.1f %5.1f %11.1f %5.1f (f_carr: %+.1f Hz)\n",
+								streams[s].chan[i].prn,
+								streams[s].chan[i].azel[0] * R2D,
+								streams[s].chan[i].azel[1] * R2D,
+								streams[s].chan[i].rho0.d,
+								streams[s].chan[i].rho0.iono_delay,
+								streams[s].chan[i].f_carr);
+					}
 				}
 			}
 		}
@@ -2622,33 +2852,29 @@ int main(int argc, char *argv[])
 		fflush(stdout);
 	}
 
-#ifdef ENABLE_CUDA
-	if (use_cuda && numd > 1)
+	for (int s = 0; s < num_streams; s++)
 	{
-		void *out_ptr = NULL;
-		size_t out_bytes = 0;
-		cuda_sync_and_get_output(&out_ptr, &out_bytes, numd - 1);
-		fwrite(out_ptr, 1, out_bytes, fp);
-	}
+#ifdef ENABLE_CUDA
+		if (streams[s].use_cuda && numd > 1)
+		{
+			void *out_ptr = NULL;
+			size_t out_bytes = 0;
+			cuda_sync_and_get_output(&out_ptr, &out_bytes, numd - 1);
+			fwrite(out_ptr, 1, out_bytes, streams[s].fp);
+		}
 #endif
-
-	tend = clock();
-
-	fprintf(stderr, "\nDone!\n");
-
-	// Free I/Q buffer
-	free(iq_buff);
+		freeSimStream(&streams[s]);
+	}
 
 #ifdef ENABLE_CUDA
 	if (use_cuda)
 		cuda_cleanup_simulator();
 #endif
 
-	// Close file
-	fclose(fp);
+	tend = clock();
 
-	// Process time
-	fprintf(stderr, "Process time = %.1f [sec]\n", (double)(tend-tstart)/CLOCKS_PER_SEC);
+	fprintf(stderr, "\nDone!\n");
+	fprintf(stderr, "Process time = %.1f [sec]\n", (double)(tend - tstart) / CLOCKS_PER_SEC);
 
-	return(0);
+	return 0;
 }
