@@ -13,6 +13,7 @@
 #define STRICMP strcasecmp
 #endif
 #include "gpssim.h"
+#include "l5_code.h"
 #ifdef ENABLE_CUDA
 #include "gpssim_cuda.cuh"
 #endif

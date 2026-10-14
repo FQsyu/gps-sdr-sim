@@ -4,7 +4,7 @@ project(gps-sdr-sim C CXX)
 option(ENABLE_CUDA "Enable CUDA GPU acceleration" ON)
 set(USER_MOTION_SIZE "3000" CACHE STRING "Maximum duration at 10Hz")
 
-set(SRCS gpssim.c)
+set(SRCS gpssim.c l5_code.c)
 
 if(WIN32)
     list(APPEND SRCS getopt.c)
@@ -85,3 +85,13 @@ endif()
 if(UNIX)
     target_link_libraries(gps-sdr-sim PRIVATE m)
 endif()
+
+# Unit test for L5 PRN code and Neumann-Hoffman secondary code
+add_executable(test_l5_code test_l5_code.c l5_code.c)
+if(MSVC)
+    target_compile_options(test_l5_code PRIVATE /W3 /O2 /utf-8 /wd4819)
+endif()
+if(UNIX)
+    target_link_libraries(test_l5_code PRIVATE m)
+endif()
+

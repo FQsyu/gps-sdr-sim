@@ -18,17 +18,26 @@ ENABLE_CUDA ?= $(shell which $(NVCC) >/dev/null 2>&1 && echo 1 || echo 0)
 ifeq ($(ENABLE_CUDA), 1)
 CFLAGS+=-DENABLE_CUDA
 NVCCFLAGS=-O3 -arch=native
-OBJS=gpssim.o gpssim_cuda.o
+OBJS=gpssim.o l5_code.o gpssim_cuda.o
 LD=$(NVCC)
 else
-OBJS=gpssim.o
+OBJS=gpssim.o l5_code.o
 LD=$(CC)
 endif
 
 gps-sdr-sim: $(OBJS)
 	${LD} $^ ${LDFLAGS} -o $@
 
-gpssim.o: gpssim.c .user-motion-size gpssim.h
+test_l5_code: test_l5_code.o l5_code.o
+	${CC} $^ ${LDFLAGS} -o $@
+
+test_l5_code.o: test_l5_code.c l5_code.h
+	${CC} -c ${CFLAGS} $< -o $@
+
+l5_code.o: l5_code.c l5_code.h
+	${CC} -c ${CFLAGS} $< -o $@
+
+gpssim.o: gpssim.c .user-motion-size gpssim.h l5_code.h
 	${CC} -c ${CFLAGS} $< -o $@
 
 gpssim_cuda.o: gpssim_cuda.cu gpssim_cuda.cuh gpssim.h
@@ -45,7 +54,8 @@ gpssim_cuda.o: gpssim_cuda.cu gpssim_cuda.cuh gpssim.h
 	fi;
 
 clean:
-	rm -f gpssim.o gpssim_cuda.o gps-sdr-sim *.bin .user-motion-size
+	rm -f gpssim.o l5_code.o gpssim_cuda.o test_l5_code.o test_l5_code gps-sdr-sim *.bin .user-motion-size
+
 
 time: gps-sdr-sim
 	time ./gps-sdr-sim -e brdc3540.14n -u circle.csv -b 1
