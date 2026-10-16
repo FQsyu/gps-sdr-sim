@@ -21,8 +21,20 @@ typedef struct {
 	int ca[CA_SEQ_LEN];
 } cuda_channel_t;
 
+typedef struct {
+	int prn;
+	int sat_idx;                     /*!< 0..MAX_SAT-1 (prn2sat) */
+	int gain;
+	unsigned int carr_phase;
+	int carr_phasestep;
+	double code_phase;
+	double f_code;
+	long long int ms_in_msg;         /*!< 0..5999 */
+	signed char cnav_symbols[1200];  /*!< Current (0..599) and next (600..1199) CNAV symbols (+1 or -1) */
+} cuda_channel_l5_t;
+
 /*! \brief Initialize CUDA resources (buffers, streams, pinned memory, constant tables) */
-int cuda_init_simulator(int iq_buff_size, int data_format);
+int cuda_init_simulator(int iq_buff_size, int data_format, int band);
 
 /*! \brief Free all CUDA resources */
 void cuda_cleanup_simulator(void);
@@ -33,7 +45,8 @@ void cuda_queue_block(
 	int num_channels,
 	const int *gain,
 	double delt,
-	int iumd
+	int iumd,
+	int band
 );
 
 /*! \brief Synchronize completed block and retrieve pointer to output buffer for writing */

@@ -293,6 +293,7 @@ typedef struct
 	int codeL5I;                 /*!< Current L5 I5 code chip (+1 or -1) */
 	int codeL5Q;                 /*!< Current L5 Q5 code chip (+1 or -1) */
 	int ms_epoch;                /*!< 1 ms epoch index (0..19) */
+	int ms_in_msg;               /*!< Millisecond within 6s CNAV message (0..5999) */
 } channel_t;
 
 /*! \brief Structure representing a synchronized simulation stream (e.g. L1 or L5) */

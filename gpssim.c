@@ -1495,6 +1495,7 @@ void computeCodePhaseBand(channel_t *chan, range_t rho1, double dt, const band_p
 		int total_ms = (int)floor(sec_in_msg * 1000.0);
 		if (total_ms < 0) total_ms = 0;
 		if (total_ms >= 6000) total_ms = 5999;
+		chan->ms_in_msg = total_ms;
 
 		int sym_idx = total_ms / 10;
 		int ms_in_sym = total_ms % 10;
@@ -1502,13 +1503,12 @@ void computeCodePhaseBand(channel_t *chan, range_t rho1, double dt, const band_p
 
 		if (chan->cnav.tow_count != tow_count)
 		{
-			cnav_channel_init(&chan->cnav, &chan->cnav.eph, &chan->cnav.ionoutc, chan->prn, tx_tow);
+			chan->cnav.tow_count = tow_count;
+			chan->cnav.cycle_idx = tow_count % CNAV_CYCLE_MSGS;
+			cnav_channel_build_msg(&chan->cnav);
 		}
-		else
-		{
-			chan->cnav.symbol_idx = sym_idx;
-			chan->cnav.ms_in_symbol = ms_in_sym;
-		}
+		chan->cnav.symbol_idx = sym_idx;
+		chan->cnav.ms_in_symbol = ms_in_sym;
 		chan->ms_epoch = ms_ep;
 		chan->cnav_symbol = cnav_channel_get_symbol(&chan->cnav);
 		chan->nh10_chip = NH10_BIPHASE[chan->cnav.ms_in_symbol];
@@ -1875,6 +1875,9 @@ int allocateChannelBand(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstim
 							chan[i].ms_epoch = (int)floor((t_tx - floor(t_tx / 6.0) * 6.0) * 1000.0) % 20;
 							if (chan[i].ms_epoch < 0) chan[i].ms_epoch = 0;
 							chan[i].nh20_chip = NH20_BIPHASE[chan[i].ms_epoch];
+							chan[i].ms_in_msg = (int)floor((t_tx - floor(t_tx / 6.0) * 6.0) * 1000.0);
+							if (chan[i].ms_in_msg < 0) chan[i].ms_in_msg = 0;
+							if (chan[i].ms_in_msg >= 6000) chan[i].ms_in_msg = 5999;
 							chan[i].codeL5I = chan[i].l5i[0];
 							chan[i].codeL5Q = chan[i].l5q[0];
 						}
@@ -1922,6 +1925,9 @@ int allocateChannelBand(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstim
 						chan[i].ms_epoch = (int)floor((t_tx - floor(t_tx / 6.0) * 6.0) * 1000.0) % 20;
 						if (chan[i].ms_epoch < 0) chan[i].ms_epoch = 0;
 						chan[i].nh20_chip = NH20_BIPHASE[chan[i].ms_epoch];
+						chan[i].ms_in_msg = (int)floor((t_tx - floor(t_tx / 6.0) * 6.0) * 1000.0);
+						if (chan[i].ms_in_msg < 0) chan[i].ms_in_msg = 0;
+						if (chan[i].ms_in_msg >= 6000) chan[i].ms_in_msg = 5999;
 						chan[i].codeL5I = chan[i].l5i[0];
 						chan[i].codeL5Q = chan[i].l5q[0];
 					}
@@ -2057,12 +2063,10 @@ int initSimStream(sim_stream_t *stream, gnss_band_t band, double samp_freq, int 
 	}
 
 	stream->use_cuda = use_cuda;
-	if (stream->band == BAND_L5)
-		stream->use_cuda = FALSE;
 #ifdef ENABLE_CUDA
 	if (stream->use_cuda)
 	{
-		if (cuda_init_simulator(stream->iq_buff_size, data_format) < 0)
+		if (cuda_init_simulator(stream->iq_buff_size, data_format, stream->band) < 0)
 		{
 			fprintf(stderr, "CUDA initialization failed for [%s], falling back to CPU.\n", stream->param.name);
 			stream->use_cuda = FALSE;
@@ -2157,13 +2161,18 @@ void generateSamplesStream(sim_stream_t *stream, int data_format, int iumd, int 
 			fwrite(out_ptr, 1, out_bytes, stream->fp);
 		}
 
-		cuda_queue_block(stream->chan, MAX_CHAN, stream->gain, stream->delt, iumd);
+		cuda_queue_block(stream->chan, MAX_CHAN, stream->gain, stream->delt, iumd, stream->band);
 
 		for (int i = 0; i < MAX_CHAN; i++)
 		{
 			if (stream->chan[i].prn > 0)
 			{
 				stream->chan[i].carr_phase += (unsigned int)stream->iq_buff_size * (unsigned int)stream->chan[i].carr_phasestep;
+				if (stream->band == BAND_L5)
+				{
+					for (int m = 0; m < 100; m++)
+						cnav_channel_step_ms(&stream->chan[i].cnav);
+				}
 			}
 		}
 		return;

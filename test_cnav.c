@@ -144,7 +144,15 @@ int main(int argc, char **argv)
 
 		cnav_channel_step_ms(&chan);
 	}
-	printf("[PASS] I5 FEC symbol and NH10/NH20 10ms synchronization verified.\n\n");
+	printf("[PASS] I5 FEC symbol and NH10/NH20 10ms synchronization verified.\n");
+
+	/* Test 1200 symbols buffer for GPU generation */
+	signed char syms_1200[1200];
+	cnav_channel_get_2msg_symbols(&chan, syms_1200);
+	for (int i = 0; i < 1200; i++) {
+		assert(syms_1200[i] == 1 || syms_1200[i] == -1);
+	}
+	printf("[PASS] 1200 CNAV 2-message symbols buffer for GPU verified.\n\n");
 
 	printf("ALL CNAV UNIT TESTS PASSED SUCCESSFULLY (100%%)!\n");
 	return 0;

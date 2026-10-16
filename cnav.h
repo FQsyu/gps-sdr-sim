@@ -127,11 +127,23 @@ void cnav_channel_init(cnav_channel_t *chan, const ephem_t *eph, const ionoutc_t
  */
 void cnav_channel_step_ms(cnav_channel_t *chan);
 
+/*! \brief Build and FEC-encode current cycle message for CNAV channel based on tow_count and cycle_idx.
+ *  \param[in,out] chan CNAV channel
+ */
+void cnav_channel_build_msg(cnav_channel_t *chan);
+
 /*! \brief Get current CNAV symbol (+1 or -1) for I5 channel.
  *  \param[in] chan CNAV channel
  *  \return Modulated sign (+1 or -1)
  */
 int cnav_channel_get_symbol(const cnav_channel_t *chan);
+
+/*! \brief Retrieve 1200 bi-phase symbols (+1 or -1) covering the current 6-second message
+ *  and the consecutive next 6-second message for GPU sample generation.
+ *  \param[in] chan CNAV channel
+ *  \param[out] symbols_1200 Output array of 1200 signed chars (+1 or -1)
+ */
+void cnav_channel_get_2msg_symbols(const cnav_channel_t *chan, signed char *symbols_1200);
 
 /*! \brief Self-test and verification of CNAV message generation, CRC-24Q, and FEC encoding.
  *  \param[in] verbose If non-zero, print detailed verification logs to stdout.

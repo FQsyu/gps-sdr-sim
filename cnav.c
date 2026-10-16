@@ -309,7 +309,7 @@ void cnav_fec_encode_msg(cnav_fec_t *fec, const int *bits, int nbits, int *symbo
 }
 
 /* Channel streaming */
-static void build_current_cycle_msg(cnav_channel_t *chan)
+void cnav_channel_build_msg(cnav_channel_t *chan)
 {
 	if (chan->cycle_idx == 0) {
 		cnav_build_type10(&chan->eph, chan->prn, chan->tow_count, chan->msg_bits);
@@ -337,7 +337,7 @@ void cnav_channel_init(cnav_channel_t *chan, const ephem_t *eph, const ionoutc_t
 	chan->tow_count = (unsigned int)floor(start_tow / 6.0);
 	chan->cycle_idx = chan->tow_count % CNAV_CYCLE_MSGS;
 
-	build_current_cycle_msg(chan);
+	cnav_channel_build_msg(chan);
 
 	/* Determine offset within the 6-second message (0..599 symbols, 0..9 ms) */
 	double sec_in_msg = start_tow - (floor(start_tow / 6.0) * 6.0);
@@ -360,7 +360,7 @@ void cnav_channel_step_ms(cnav_channel_t *chan)
 			chan->symbol_idx = 0;
 			chan->tow_count++;
 			chan->cycle_idx = (chan->cycle_idx + 1) % CNAV_CYCLE_MSGS;
-			build_current_cycle_msg(chan);
+			cnav_channel_build_msg(chan);
 		}
 	}
 }
@@ -369,6 +369,35 @@ int cnav_channel_get_symbol(const cnav_channel_t *chan)
 {
 	/* Map binary symbol 0 -> +1, 1 -> -1 */
 	return (chan->msg_symbols[chan->symbol_idx] == 0) ? 1 : -1;
+}
+
+void cnav_channel_get_2msg_symbols(const cnav_channel_t *chan, signed char *symbols_1200)
+{
+	/* 1. First 600 symbols: current message */
+	for (int i = 0; i < CNAV_MSG_SYMBOLS; i++) {
+		symbols_1200[i] = (chan->msg_symbols[i] == 0) ? 1 : -1;
+	}
+
+	/* 2. Next 600 symbols: next consecutive message (tow_count + 1) */
+	int next_bits[CNAV_MSG_BITS];
+	int next_symbols[CNAV_MSG_SYMBOLS];
+	unsigned int next_tow = chan->tow_count + 1;
+	int next_cycle = next_tow % CNAV_CYCLE_MSGS;
+
+	if (next_cycle == 0) {
+		cnav_build_type10(&chan->eph, chan->prn, next_tow, next_bits);
+	} else if (next_cycle == 1) {
+		cnav_build_type11(&chan->eph, chan->prn, next_tow, next_bits);
+	} else {
+		cnav_build_type30(&chan->eph, &chan->ionoutc, chan->prn, next_tow, next_bits);
+	}
+
+	cnav_fec_t next_fec = chan->fec;
+	cnav_fec_encode_msg(&next_fec, next_bits, CNAV_MSG_BITS, next_symbols);
+
+	for (int i = 0; i < CNAV_MSG_SYMBOLS; i++) {
+		symbols_1200[CNAV_MSG_SYMBOLS + i] = (next_symbols[i] == 0) ? 1 : -1;
+	}
 }
 
 /* Self-test and verification */
