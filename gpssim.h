@@ -255,6 +255,9 @@ typedef struct
 	double clk_bias; /*!< SV clock bias c * clk [m] */
 } range_t;
 
+#include "l5_code.h"
+#include "cnav.h"
+
 /*! \brief Structure representing a Channel */
 typedef struct
 {
@@ -279,6 +282,17 @@ typedef struct
 	int codeCA;	/*!< current C/A code */
 	double azel[2];
 	range_t rho0;
+
+	/* L5 signal parameters */
+	int l5i[CA_SEQ_LEN_L5];      /*!< L5 I5 primary PRN code (+1 or -1) */
+	int l5q[CA_SEQ_LEN_L5];      /*!< L5 Q5 primary PRN code (+1 or -1) */
+	cnav_channel_t cnav;         /*!< CNAV channel state */
+	int cnav_symbol;             /*!< Current CNAV symbol (+1 or -1) */
+	int nh10_chip;               /*!< Current NH10 chip (+1 or -1) */
+	int nh20_chip;               /*!< Current NH20 chip (+1 or -1) */
+	int codeL5I;                 /*!< Current L5 I5 code chip (+1 or -1) */
+	int codeL5Q;                 /*!< Current L5 Q5 code chip (+1 or -1) */
+	int ms_epoch;                /*!< 1 ms epoch index (0..19) */
 } channel_t;
 
 /*! \brief Structure representing a synchronized simulation stream (e.g. L1 or L5) */

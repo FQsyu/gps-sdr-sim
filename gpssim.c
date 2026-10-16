@@ -1483,22 +1483,65 @@ void computeCodePhaseBand(channel_t *chan, range_t rho1, double dt, const band_p
 	ims = (int)ms;
 	chan->code_phase = (ms-(double)ims)*(double)band->code_seq_len; // in chips
 
-	chan->iword = ims/600; // 1 word = 30 bits = 600 ms
-	ims -= chan->iword*600;
+	if (band->band == BAND_L5)
+	{
+		double tx_sec = subGpsTime(chan->rho0.g, chan->g0) - chan->rho0.range / SPEED_OF_LIGHT;
+		double tx_tow = chan->g0.sec + tx_sec;
+		while (tx_tow < 0.0) tx_tow += SECONDS_IN_WEEK;
+		while (tx_tow >= SECONDS_IN_WEEK) tx_tow -= SECONDS_IN_WEEK;
 
-	chan->ibit = ims/20; // 1 bit = 20 code = 20 ms
-	ims -= chan->ibit*20;
+		unsigned int tow_count = (unsigned int)floor(tx_tow / 6.0);
+		double sec_in_msg = tx_tow - (floor(tx_tow / 6.0) * 6.0);
+		int total_ms = (int)floor(sec_in_msg * 1000.0);
+		if (total_ms < 0) total_ms = 0;
+		if (total_ms >= 6000) total_ms = 5999;
 
-	chan->icode = ims; // 1 code = 1 ms
+		int sym_idx = total_ms / 10;
+		int ms_in_sym = total_ms % 10;
+		int ms_ep = total_ms % 20;
 
-	int code_idx = (int)chan->code_phase;
-	if (code_idx >= band->code_seq_len)
-		code_idx = band->code_seq_len - 1;
-	else if (code_idx < 0)
-		code_idx = 0;
+		if (chan->cnav.tow_count != tow_count)
+		{
+			cnav_channel_init(&chan->cnav, &chan->cnav.eph, &chan->cnav.ionoutc, chan->prn, tx_tow);
+		}
+		else
+		{
+			chan->cnav.symbol_idx = sym_idx;
+			chan->cnav.ms_in_symbol = ms_in_sym;
+		}
+		chan->ms_epoch = ms_ep;
+		chan->cnav_symbol = cnav_channel_get_symbol(&chan->cnav);
+		chan->nh10_chip = NH10_BIPHASE[chan->cnav.ms_in_symbol];
+		chan->nh20_chip = NH20_BIPHASE[chan->ms_epoch];
 
-	chan->codeCA = chan->ca[code_idx % CA_SEQ_LEN_L1]*2-1;
-	chan->dataBit = (int)((chan->dwrd[chan->iword]>>(29-chan->ibit)) & 0x1UL)*2-1;
+		int code_idx = (int)chan->code_phase;
+		if (code_idx >= band->code_seq_len)
+			code_idx = band->code_seq_len - 1;
+		else if (code_idx < 0)
+			code_idx = 0;
+
+		chan->codeL5I = chan->l5i[code_idx];
+		chan->codeL5Q = chan->l5q[code_idx];
+	}
+	else
+	{
+		chan->iword = ims/600; // 1 word = 30 bits = 600 ms
+		ims -= chan->iword*600;
+
+		chan->ibit = ims/20; // 1 bit = 20 code = 20 ms
+		ims -= chan->ibit*20;
+
+		chan->icode = ims; // 1 code = 1 ms
+
+		int code_idx = (int)chan->code_phase;
+		if (code_idx >= band->code_seq_len)
+			code_idx = band->code_seq_len - 1;
+		else if (code_idx < 0)
+			code_idx = 0;
+
+		chan->codeCA = chan->ca[code_idx % CA_SEQ_LEN_L1]*2-1;
+		chan->dataBit = (int)((chan->dwrd[chan->iword]>>(29-chan->ibit)) & 0x1UL)*2-1;
+	}
 
 	// Save current pseudorange
 	chan->rho0 = rho1;
@@ -1820,6 +1863,22 @@ int allocateChannelBand(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstim
 						computeRangeBand(&rho, eph[sv], &ionoutc, grx, xyz, band);
 						chan[i].rho0 = rho;
 
+						if (band->band == BAND_L5)
+						{
+							generate_l5_code_biphase(chan[i].prn, chan[i].l5i, chan[i].l5q);
+							double t_tx = grx.sec - rho.range / SPEED_OF_LIGHT;
+							while (t_tx < 0.0) t_tx += SECONDS_IN_WEEK;
+							while (t_tx >= SECONDS_IN_WEEK) t_tx -= SECONDS_IN_WEEK;
+							cnav_channel_init(&chan[i].cnav, &eph[sv], &ionoutc, chan[i].prn, t_tx);
+							chan[i].cnav_symbol = cnav_channel_get_symbol(&chan[i].cnav);
+							chan[i].nh10_chip = NH10_BIPHASE[chan[i].cnav.ms_in_symbol];
+							chan[i].ms_epoch = (int)floor((t_tx - floor(t_tx / 6.0) * 6.0) * 1000.0) % 20;
+							if (chan[i].ms_epoch < 0) chan[i].ms_epoch = 0;
+							chan[i].nh20_chip = NH20_BIPHASE[chan[i].ms_epoch];
+							chan[i].codeL5I = chan[i].l5i[0];
+							chan[i].codeL5Q = chan[i].l5q[0];
+						}
+
 						phase_ini = 0.0;
 #ifdef FLOAT_CARR_PHASE
 						chan[i].carr_phase = phase_ini - floor(phase_ini);
@@ -1850,6 +1909,23 @@ int allocateChannelBand(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstim
 					generateNavMsg(grx, &chan[i], 1);
 					computeRangeBand(&rho, eph[sv], &ionoutc, grx, xyz, band);
 					chan[i].rho0 = rho;
+
+					if (band->band == BAND_L5)
+					{
+						generate_l5_code_biphase(chan[i].prn, chan[i].l5i, chan[i].l5q);
+						double t_tx = grx.sec - rho.range / SPEED_OF_LIGHT;
+						while (t_tx < 0.0) t_tx += SECONDS_IN_WEEK;
+						while (t_tx >= SECONDS_IN_WEEK) t_tx -= SECONDS_IN_WEEK;
+						cnav_channel_init(&chan[i].cnav, &eph[sv], &ionoutc, chan[i].prn, t_tx);
+						chan[i].cnav_symbol = cnav_channel_get_symbol(&chan[i].cnav);
+						chan[i].nh10_chip = NH10_BIPHASE[chan[i].cnav.ms_in_symbol];
+						chan[i].ms_epoch = (int)floor((t_tx - floor(t_tx / 6.0) * 6.0) * 1000.0) % 20;
+						if (chan[i].ms_epoch < 0) chan[i].ms_epoch = 0;
+						chan[i].nh20_chip = NH20_BIPHASE[chan[i].ms_epoch];
+						chan[i].codeL5I = chan[i].l5i[0];
+						chan[i].codeL5Q = chan[i].l5q[0];
+					}
+
 					phase_ini = 0.0;
 #ifdef FLOAT_CARR_PHASE
 					chan[i].carr_phase = phase_ini - floor(phase_ini);
@@ -1857,6 +1933,11 @@ int allocateChannelBand(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstim
 					phase_ini -= floor(phase_ini);
 					chan[i].carr_phase = (unsigned int)(512.0 * 65536.0 * phase_ini);
 #endif
+				}
+				else if (band->band == BAND_L5)
+				{
+					chan[i].cnav.eph = eph[sv];
+					chan[i].cnav.ionoutc = ionoutc;
 				}
 			}
 		}
@@ -1976,6 +2057,8 @@ int initSimStream(sim_stream_t *stream, gnss_band_t band, double samp_freq, int 
 	}
 
 	stream->use_cuda = use_cuda;
+	if (stream->band == BAND_L5)
+		stream->use_cuda = FALSE;
 #ifdef ENABLE_CUDA
 	if (stream->use_cuda)
 	{
@@ -2102,8 +2185,22 @@ void generateSamplesStream(sim_stream_t *stream, int data_format, int iumd, int 
 #else
 				int iTable = (stream->chan[i].carr_phase >> 16) & 0x1ff;
 #endif
-				int ip = stream->chan[i].dataBit * stream->chan[i].codeCA * cosTable512[iTable] * stream->gain[i];
-				int qp = stream->chan[i].dataBit * stream->chan[i].codeCA * sinTable512[iTable] * stream->gain[i];
+				int ip, qp;
+				if (stream->band == BAND_L5)
+				{
+					int cos_val = cosTable512[iTable];
+					int sin_val = sinTable512[iTable];
+					int s_i = stream->chan[i].cnav_symbol * stream->chan[i].nh10_chip * stream->chan[i].codeL5I;
+					int s_q = stream->chan[i].nh20_chip * stream->chan[i].codeL5Q;
+
+					ip = (s_i * cos_val - s_q * sin_val) * stream->gain[i];
+					qp = (s_i * sin_val + s_q * cos_val) * stream->gain[i];
+				}
+				else
+				{
+					ip = stream->chan[i].dataBit * stream->chan[i].codeCA * cosTable512[iTable] * stream->gain[i];
+					qp = stream->chan[i].dataBit * stream->chan[i].codeCA * sinTable512[iTable] * stream->gain[i];
+				}
 
 				i_acc += ip;
 				q_acc += qp;
@@ -2114,20 +2211,32 @@ void generateSamplesStream(sim_stream_t *stream, int data_format, int iumd, int 
 				if (stream->chan[i].code_phase >= stream->param.code_seq_len)
 				{
 					stream->chan[i].code_phase -= stream->param.code_seq_len;
-					stream->chan[i].icode++;
 
-					if (stream->chan[i].icode >= 20)
+					if (stream->band == BAND_L5)
 					{
-						stream->chan[i].icode = 0;
-						stream->chan[i].ibit++;
+						cnav_channel_step_ms(&stream->chan[i].cnav);
+						stream->chan[i].cnav_symbol = cnav_channel_get_symbol(&stream->chan[i].cnav);
+						stream->chan[i].nh10_chip = NH10_BIPHASE[stream->chan[i].cnav.ms_in_symbol];
+						stream->chan[i].ms_epoch = (stream->chan[i].ms_epoch + 1) % 20;
+						stream->chan[i].nh20_chip = NH20_BIPHASE[stream->chan[i].ms_epoch];
+					}
+					else
+					{
+						stream->chan[i].icode++;
 
-						if (stream->chan[i].ibit >= 30)
+						if (stream->chan[i].icode >= 20)
 						{
-							stream->chan[i].ibit = 0;
-							stream->chan[i].iword++;
-						}
+							stream->chan[i].icode = 0;
+							stream->chan[i].ibit++;
 
-						stream->chan[i].dataBit = (int)((stream->chan[i].dwrd[stream->chan[i].iword] >> (29 - stream->chan[i].ibit)) & 0x1UL) * 2 - 1;
+							if (stream->chan[i].ibit >= 30)
+							{
+								stream->chan[i].ibit = 0;
+								stream->chan[i].iword++;
+							}
+
+							stream->chan[i].dataBit = (int)((stream->chan[i].dwrd[stream->chan[i].iword] >> (29 - stream->chan[i].ibit)) & 0x1UL) * 2 - 1;
+						}
 					}
 				}
 
@@ -2137,7 +2246,15 @@ void generateSamplesStream(sim_stream_t *stream, int data_format, int iumd, int 
 				else if (code_idx < 0)
 					code_idx = 0;
 
-				stream->chan[i].codeCA = stream->chan[i].ca[code_idx % CA_SEQ_LEN_L1] * 2 - 1;
+				if (stream->band == BAND_L5)
+				{
+					stream->chan[i].codeL5I = stream->chan[i].l5i[code_idx];
+					stream->chan[i].codeL5Q = stream->chan[i].l5q[code_idx];
+				}
+				else
+				{
+					stream->chan[i].codeCA = stream->chan[i].ca[code_idx % CA_SEQ_LEN_L1] * 2 - 1;
+				}
 
 #ifdef FLOAT_CARR_PHASE
 				stream->chan[i].carr_phase += stream->chan[i].f_carr * stream->delt;
@@ -2681,7 +2798,8 @@ int main(int argc, char *argv[])
 	////////////////////////////////////////////////////////////
 
 	int num_streams = 0;
-	sim_stream_t streams[2];
+	static sim_stream_t streams[2];
+	memset(streams, 0, sizeof(streams));
 
 	if (band_mode == BAND_DUAL)
 	{
@@ -2803,7 +2921,14 @@ int main(int argc, char *argv[])
 							for (i = 0; i < MAX_CHAN; i++)
 							{
 								if (streams[s].chan[i].prn != 0)
+								{
 									eph2sbf(eph[ieph][prn2sat(streams[s].chan[i].prn)], ionoutc, streams[s].chan[i].sbf);
+									if (streams[s].band == BAND_L5)
+									{
+										streams[s].chan[i].cnav.eph = eph[ieph][prn2sat(streams[s].chan[i].prn)];
+										streams[s].chan[i].cnav.ionoutc = ionoutc;
+									}
+								}
 							}
 						}
 					}

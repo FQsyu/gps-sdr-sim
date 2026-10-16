@@ -4,7 +4,7 @@ project(gps-sdr-sim C CXX)
 option(ENABLE_CUDA "Enable CUDA GPU acceleration" ON)
 set(USER_MOTION_SIZE "3000" CACHE STRING "Maximum duration at 10Hz")
 
-set(SRCS gpssim.c l5_code.c)
+set(SRCS gpssim.c l5_code.c cnav.c)
 
 if(WIN32)
     list(APPEND SRCS getopt.c)
@@ -94,4 +94,14 @@ endif()
 if(UNIX)
     target_link_libraries(test_l5_code PRIVATE m)
 endif()
+
+# Unit test for L5 CNAV message generation and Rate-1/2 FEC
+add_executable(test_cnav test_cnav.c cnav.c l5_code.c)
+if(MSVC)
+    target_compile_options(test_cnav PRIVATE /W3 /O2 /utf-8 /wd4819)
+endif()
+if(UNIX)
+    target_link_libraries(test_cnav PRIVATE m)
+endif()
+
 
